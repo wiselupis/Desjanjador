@@ -2,8 +2,7 @@ use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Mutex;
-use std::time::Instant;
-use tokio::sync::watch;
+use tokio::sync::{watch, Notify};
 
 /// A validated non-BR exit the router can dial through.
 #[derive(Clone, Serialize, Default, Debug)]
@@ -31,8 +30,8 @@ pub struct Shared {
     pub status: Mutex<String>,
     pub stop_tx: Mutex<Option<watch::Sender<bool>>>,
     pub config_dir: Mutex<PathBuf>,
-    /// (session_start, last_gateway_activity) used for the bootstrap window.
-    pub boot: Mutex<Option<(Instant, Instant)>>,
+    /// Wake the pool loop to re-validate immediately (e.g. the current exit died).
+    pub refresh_now: Notify,
 }
 
 impl Shared {
@@ -44,7 +43,7 @@ impl Shared {
             status: Mutex::new("parado".into()),
             stop_tx: Mutex::new(None),
             config_dir: Mutex::new(PathBuf::new()),
-            boot: Mutex::new(None),
+            refresh_now: Notify::new(),
         }
     }
 

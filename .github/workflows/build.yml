@@ -44,6 +44,7 @@ jobs:
           files: |
             desjanjador-*.exe
             Desjanjador.ps1
+            Desjanjador.bat
             README.md
           fail_on_unmatched_files: true
 

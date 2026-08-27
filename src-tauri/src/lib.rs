@@ -50,7 +50,8 @@ fn activate(shared: &Arc<Shared>) {
             loop {
                 pool::refresh_pool(sh.clone()).await;
                 tokio::select! {
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(300)) => {}
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(120)) => {}
+                    _ = sh.refresh_now.notified() => {}
                     changed = rx_pool.changed() => {
                         if changed.is_err() || *rx_pool.borrow() { break; }
                     }

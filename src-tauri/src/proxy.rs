@@ -19,19 +19,12 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tokio_socks::tcp::Socks5Stream;
 
-/// How long to try the chosen exit before falling back to a direct connection.
-const EXIT_TIMEOUT: Duration = Duration::from_secs(8);
-/// How long to HOLD a gateway connection waiting for an exit to become ready,
-/// rather than letting it be born direct (BR IP) — which would pin the Go Live
-/// block for the whole session and never unblock, even after a routed reconnect.
-const HOLD_DEADLINE: Duration = Duration::from_secs(20);
-/// Only route the gateway through the exit during the first window of a session;
-/// after that it goes direct — the client is already bootstrapped, so we keep the
-/// dependency on a (possibly unstable) free proxy minimal.
-const BOOTSTRAP_WINDOW: Duration = Duration::from_secs(30);
-/// A gap in gateway activity longer than this marks a new session (client restart),
-/// which reopens the bootstrap window.
-const IDLE_GAP: Duration = Duration::from_secs(20);
+/// How long to try the chosen exit before failing open to a direct connection,
+/// so a slow/dead exit never leaves Discord stuck "connecting" / logged out.
+const EXIT_TIMEOUT: Duration = Duration::from_secs(6);
+/// If no exit is ready yet, HOLD a gateway connection this long waiting for one
+/// (so it's born routed) before failing open to direct.
+const HOLD_DEADLINE: Duration = Duration::from_secs(12);
 
 pub fn pac_body(port: u16) -> String {
     format!(
@@ -121,10 +114,9 @@ async fn handle_connect(
     port: u16,
 ) -> std::io::Result<()> {
     let is_gateway = host == "gateway.discord.gg" || host.ends_with(".discord.gg");
-    // Route the gateway through the exit only during the bootstrap window. If no
-    // exit is ready yet, HOLD (don't answer 200) until one appears or the deadline
-    // passes — so the session is born routed. Post-bootstrap it goes direct.
-    let exit = if is_gateway && in_bootstrap(&shared) {
+    // Always route the gateway through the exit (so Go Live survives reconnects).
+    // If no exit is ready yet, HOLD briefly so the connection is born routed.
+    let exit = if is_gateway {
         match shared.get_exit() {
             Some(e) => Some(e),
             None => wait_for_exit(&shared, HOLD_DEADLINE).await,
@@ -133,17 +125,8 @@ async fn handle_connect(
         None
     };
 
-    if is_gateway {
-        match &exit {
-            Some(e) => crate::log::log(&format!(
-                "router: gateway {host} (bootstrap) -> exit {} ({})",
-                e.ip, e.country
-            )),
-            None => crate::log::log("router: gateway -> DIRECT (pos-bootstrap ou sem saida)"),
-        }
-    }
-
-    // Try the exit first (gateway only), then always fall back to direct.
+    // Try the exit; if it's slow or dead, FAIL OPEN to a direct connection (so
+    // Discord never gets stuck / logged out) and trigger a fresh pool validation.
     let upstream: Option<Upstream> = match exit {
         Some(e) => {
             match tokio::time::timeout(
@@ -152,11 +135,30 @@ async fn handle_connect(
             )
             .await
             {
-                Ok(Ok(s)) => Some(Upstream::Socks(s)),
-                _ => connect_direct(&host, port).await.map(Upstream::Direct),
+                Ok(Ok(s)) => {
+                    crate::log::log(&format!(
+                        "router: gateway {host} -> exit {} ({})",
+                        e.ip, e.country
+                    ));
+                    Some(Upstream::Socks(s))
+                }
+                _ => {
+                    crate::log::log(&format!(
+                        "router: exit {} lento/morto -> DIRECT + revalidar",
+                        e.addr
+                    ));
+                    shared.set_exit(None);
+                    shared.refresh_now.notify_one();
+                    connect_direct(&host, port).await.map(Upstream::Direct)
+                }
             }
         }
-        None => connect_direct(&host, port).await.map(Upstream::Direct),
+        None => {
+            if is_gateway {
+                crate::log::log("router: gateway -> DIRECT (sem saida a tempo)");
+            }
+            connect_direct(&host, port).await.map(Upstream::Direct)
+        }
     };
 
     match upstream {
@@ -201,15 +203,4 @@ async fn wait_for_exit(shared: &Arc<Shared>, deadline: Duration) -> Option<ExitI
     }
 }
 
-/// Update the session boot state; return whether we're still in the bootstrap
-/// window. A gap in gateway activity longer than IDLE_GAP starts a new session.
-fn in_bootstrap(shared: &Arc<Shared>) -> bool {
-    let now = Instant::now();
-    let mut b = shared.boot.lock().unwrap();
-    let session_start = match *b {
-        Some((ss, last)) if now.duration_since(last) <= IDLE_GAP => ss,
-        _ => now, // first connection ever, or the client restarted
-    };
-    *b = Some((session_start, now));
-    now.duration_since(session_start) < BOOTSTRAP_WINDOW
-}
+// (routing is now always-on for the gateway; bootstrap window removed)
