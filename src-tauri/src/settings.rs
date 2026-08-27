@@ -13,7 +13,7 @@ pub fn load(dir: &Path) -> Settings {
     let p = dir.join("settings.json");
     std::fs::read_to_string(p)
         .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
+        .and_then(|s| serde_json::from_str(s.trim_start_matches('\u{feff}')).ok())
         .unwrap_or_default()
 }
 

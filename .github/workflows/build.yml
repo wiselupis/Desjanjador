@@ -41,7 +41,10 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: desjanjador-*.exe
+          files: |
+            desjanjador-*.exe
+            Desjanjador.ps1
+            README.md
           fail_on_unmatched_files: true
 
       - name: Upload build artifact

@@ -21,16 +21,18 @@ assinatura).
 - **Aplicar patch** — coloca `Desjanjador.plugin.js` no BetterDiscord (rede de
   segurança; o desbloqueio de verdade é o proxy do gateway).
 
-## Instalar / iniciar com o Windows
+## Rodar (Windows 10 e 11)
+
+Baixe o `Desjanjador.ps1` e rode no PowerShell:
 
 ```powershell
-.\install.ps1
+.\Desjanjador.ps1
 ```
 
-- Copia o exe para `%LOCALAPPDATA%\Desjanjador`, tira a "marca da web" (`Unblock-File`)
-  e liga a inicialização com o Windows (chave Run).
-- Rodar **como Administrador** uma vez adiciona uma exclusão no Defender (opcional).
-- Remover: `.\install.ps1 -Uninstall`.
+Ele baixa o exe mais recente do GitHub (ou usa um `desjanjador.exe` ao lado dele),
+garante o WebView2 (Windows 10), tira a marca da web (bypass do aviso do SmartScreen)
+e abre. A inicialização com o Windows liga/desliga **dentro do app**. Para remover:
+`.\Desjanjador.ps1 -Uninstall`.
 
 ## Aviso
 

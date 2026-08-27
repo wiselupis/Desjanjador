@@ -11,7 +11,7 @@ static LOG_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
 pub fn init(dir: &Path) {
     let _ = std::fs::create_dir_all(dir);
     *LOG_PATH.lock().unwrap() = Some(dir.join("desjanjador.log"));
-    log("=== session start ===");
+    log(&format!("=== session start v{} ===", env!("CARGO_PKG_VERSION")));
 }
 
 pub fn log(msg: &str) {

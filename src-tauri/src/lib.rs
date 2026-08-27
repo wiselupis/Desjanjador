@@ -201,6 +201,26 @@ pub fn run() {
                 let _ = w.set_title("Desjanjador");
             }
 
+            // DESJANJADOR_AUTOUPDATE=1 applies an available update silently (no
+            // popup) — used to validate the self-updater with an old exe.
+            if std::env::var("DESJANJADOR_AUTOUPDATE").is_ok() {
+                let h = handle.clone();
+                let sh = shared_setup.clone();
+                tauri::async_runtime::spawn(async move {
+                    match updater::check().await {
+                        Ok(info) if info.available => {
+                            log::log(&format!("autoupdate: {} -> {}", info.current, info.version));
+                            cleanup(&sh);
+                            if updater::apply(info.url).await.is_ok() {
+                                h.exit(0);
+                            }
+                        }
+                        Ok(_) => log::log("autoupdate: ja atualizado"),
+                        Err(e) => log::log(&format!("autoupdate erro: {e}")),
+                    }
+                });
+            }
+
             // Resolve + remember the config dir for settings persistence.
             if let Ok(dir) = app.path().app_config_dir() {
                 log::init(&dir);

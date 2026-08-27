@@ -176,6 +176,11 @@ async fn fetch_candidates() -> Vec<Cand> {
 
     // Query both providers in parallel and merge (dedup by addr) for speed + reach.
     let (ps, gn) = tokio::join!(fetch_proxyscrape(&client), fetch_geonode(&client));
+    crate::log::log(&format!(
+        "pool: sources proxyscrape={} geonode={}",
+        ps.len(),
+        gn.len()
+    ));
     let mut cands = ps;
     cands.extend(gn);
     {
