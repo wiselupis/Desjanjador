@@ -7,6 +7,7 @@ node_modules
 dist
 dist-ssr
 dist-portable
+updater-test
 src-tauri/target
 src-tauri/gen/schemas
 
