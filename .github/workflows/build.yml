@@ -33,18 +33,14 @@ jobs:
       - name: Build exe (release)
         run: cargo build --release --manifest-path src-tauri/Cargo.toml
 
-      - name: Name the artifact
-        shell: pwsh
-        run: Copy-Item src-tauri/target/release/desjanjador.exe "desjanjador-${{ github.ref_name }}.exe"
-
       - name: Publish release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            desjanjador-*.exe
-            Desjanjador.ps1
-            Desjanjador.bat
+            src-tauri/target/release/desjanjador.exe
+            Install.bat
+            Uninstall.bat
             README.md
           fail_on_unmatched_files: true
 
@@ -53,4 +49,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: desjanjador-exe
-          path: desjanjador-*.exe
+          path: src-tauri/target/release/desjanjador.exe

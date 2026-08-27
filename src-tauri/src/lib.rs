@@ -1,4 +1,6 @@
+mod autostart;
 mod clients;
+mod elevate;
 mod log;
 mod pool;
 mod proxy;
@@ -13,7 +15,6 @@ use std::sync::Arc;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager, State};
-use tauri_plugin_autostart::ManagerExt;
 
 /// Local port the router + PAC live on.
 const PORT: u16 = 43110;
@@ -80,11 +81,10 @@ fn cleanup(shared: &Arc<Shared>) {
     let _ = sysproxy::disable();
 }
 
-fn status_dto(app: &AppHandle, shared: &Shared) -> StatusDto {
-    let autostart = app.autolaunch().is_enabled().unwrap_or(false);
+fn status_dto(_app: &AppHandle, shared: &Shared) -> StatusDto {
     StatusDto {
         active: shared.active.load(Ordering::SeqCst),
-        autostart,
+        autostart: shared.autostart.load(Ordering::SeqCst),
         status: shared.status.lock().unwrap().clone(),
         exit: shared.get_exit(),
         port: shared.port,
@@ -111,14 +111,15 @@ fn set_active(app: AppHandle, shared: State<Arc<Shared>>, on: bool) -> StatusDto
 }
 
 #[tauri::command]
-fn set_autostart(app: AppHandle, on: bool) -> Result<bool, String> {
-    let m = app.autolaunch();
+fn set_autostart(shared: State<Arc<Shared>>, on: bool) -> Result<bool, String> {
     if on {
-        m.enable().map_err(|e| e.to_string())?;
+        autostart::enable()?;
     } else {
-        m.disable().map_err(|e| e.to_string())?;
+        autostart::disable()?;
     }
-    Ok(m.is_enabled().unwrap_or(on))
+    let now = autostart::is_enabled();
+    shared.autostart.store(now, Ordering::SeqCst);
+    Ok(now)
 }
 
 #[tauri::command]
@@ -163,16 +164,13 @@ async fn apply_update(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    elevate::ensure_elevated();
     let shared = Arc::new(Shared::new(PORT));
     let shared_setup = shared.clone();
     let shared_run = shared.clone();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .plugin(tauri_plugin_autostart::init(
-            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
-            Some(vec![]),
-        ))
         .manage(shared.clone())
         .invoke_handler(tauri::generate_handler![
             get_status,
@@ -227,6 +225,9 @@ pub fn run() {
                 log::init(&dir);
                 *shared_setup.config_dir.lock().unwrap() = dir;
             }
+            shared_setup
+                .autostart
+                .store(autostart::is_enabled(), Ordering::SeqCst);
 
             // Tray icon with an Open / Exit menu.
             let open_i = MenuItem::with_id(&handle, "open", "Open", true, None::<&str>)?;

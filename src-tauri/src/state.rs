@@ -26,6 +26,8 @@ pub struct StatusDto {
 pub struct Shared {
     pub port: u16,
     pub active: AtomicBool,
+    /// Cached "start with Windows" state (avoids spawning schtasks on every poll).
+    pub autostart: AtomicBool,
     pub exit: Mutex<Option<ExitInfo>>,
     pub status: Mutex<String>,
     pub stop_tx: Mutex<Option<watch::Sender<bool>>>,
@@ -39,6 +41,7 @@ impl Shared {
         Shared {
             port,
             active: AtomicBool::new(false),
+            autostart: AtomicBool::new(false),
             exit: Mutex::new(None),
             status: Mutex::new("parado".into()),
             stop_tx: Mutex::new(None),

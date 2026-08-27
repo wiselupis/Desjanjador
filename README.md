@@ -23,14 +23,10 @@ assinatura).
 
 ## Rodar (Windows 10 e 11)
 
-Baixe `Desjanjador.bat` **e** `Desjanjador.ps1` (ficam juntos) e dê **dois cliques no
-`.bat`**. Não dê dois cliques no `.ps1` — o Windows abre no bloco de notas. (Alternativa:
-clique-direito no `.ps1` → **Executar com o PowerShell**.)
-
-Ele pede admin (UAC), garante o WebView2 (Windows 10), baixa o exe mais recente do GitHub
-(ou usa um `desjanjador.exe` ao lado), tira a marca da web (bypass do SmartScreen), exclui
-a pasta no Defender e abre o app **sem admin**. A inicialização com o Windows liga/desliga
-**dentro do app**. Para remover: `Desjanjador.bat -Uninstall`.
+Baixe **`Install.bat`** e dê **dois cliques**. Ele garante o WebView2 (Windows 10), baixa
+o exe mais recente do GitHub e abre o app — que então **pede admin (UAC)**. A inicialização
+com o Windows liga/desliga **dentro do app** (cria uma tarefa agendada que aponta pro exe,
+sem cópia). Para remover: **`Uninstall.bat`** (dois cliques, pede admin).
 
 ## Aviso
 
