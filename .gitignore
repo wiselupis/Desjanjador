@@ -1,0 +1,28 @@
+# dependencies
+node_modules
+.pnp
+.pnp.js
+
+# build output
+dist
+dist-ssr
+dist-portable
+src-tauri/target
+src-tauri/gen/schemas
+
+# local
+*.local
+*.log
+.env
+.env.*
+
+# icon build input (icons/ is committed, this is the intermediate square source)
+src-tauri/icon-src.png
+
+# editor / os
+.DS_Store
+.idea
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
