@@ -110,6 +110,7 @@ async fn discover(shared: Arc<Shared>, m: &mut Maint) {
         return;
     }
     m.fails = 0; // the exit we're about to publish gets a fresh grace budget
+    let t0 = Instant::now();
     crate::log::log("pool: procurando saída");
     shared.set_status("procurando uma saída rápida fora do Brasil…");
 
@@ -160,6 +161,10 @@ async fn discover(shared: Arc<Shared>, m: &mut Maint) {
 
     // Remember the working exit so the next launch re-tries it instantly.
     if let Some(e) = shared.get_exit() {
+        crate::log::log(&format!(
+            "pool: saída pronta em {:.1}s",
+            t0.elapsed().as_secs_f32()
+        ));
         let dir = shared.config_dir.lock().unwrap().clone();
         crate::settings::save_last_exit(&dir, Some(e));
     } else if shared.active.load(Ordering::SeqCst) {

@@ -210,7 +210,7 @@ export default function App() {
         </ol>
         <span className="tip">
           A saída é escolhida automaticamente entre proxies rápidos e confiáveis. O
-          Tor&nbsp;Browser, se estiver aberto, também serve como alternativa.
+          Tor&nbsp;é só uma alternativa.
         </span>
       </section>
 
