@@ -219,8 +219,8 @@ export default function App() {
         />
         <div className="divider" />
         <Toggle
-          label="Desbloquear canais +18"
-          hint="Roteia também a API do Discord (as ações podem ficar um pouco mais lentas)"
+          label="Desbloquear canais restritos"
+          hint="Roteia também a API do Discord para abrir canais restritos (as ações podem ficar um pouco mais lentas)"
           checked={s?.proxy_api ?? false}
           onChange={toggleApi}
         />

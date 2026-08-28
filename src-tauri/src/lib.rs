@@ -315,6 +315,18 @@ pub fn run() {
             updater::cleanup_old();
             if let Some(w) = app.get_webview_window("main") {
                 let _ = w.set_title(&format!("Desjanjador v{}", env!("CARGO_PKG_VERSION")));
+                // Fit the window to the screen so it never runs off the bottom on small
+                // or high-DPI displays (e.g. 150% scaling on a 1080p panel = 720 logical
+                // px, less than our 730 design height, or a 1366x768 laptop). Clamp the
+                // height to the monitor's usable area; the content's own scroll
+                // (overflow-y:auto with the footer pinned) absorbs any shortfall.
+                if let Ok(Some(mon)) = w.current_monitor() {
+                    let logical_h = mon.size().height as f64 / mon.scale_factor();
+                    let usable = (logical_h - 80.0).max(480.0); // reserve taskbar + title bar
+                    let h = 730.0_f64.min(usable);
+                    let _ = w.set_size(tauri::LogicalSize::new(440.0, h));
+                    let _ = w.center();
+                }
             }
 
             // DESJANJADOR_AUTOUPDATE=1 applies an available update silently (no
