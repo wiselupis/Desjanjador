@@ -1,6 +1,6 @@
 [package]
 name = "desjanjador"
-version = "0.1.6"
+version = "0.1.7"
 description = "Desjanjador — network privacy patches"
 authors = ["WiseLupis"]
 edition = "2021"
@@ -9,6 +9,13 @@ edition = "2021"
 # The `_lib` suffix keeps the lib name unique from the bin name (Windows quirk).
 name = "desjanjador_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
+
+[features]
+# REQUIRED for production: enables Tauri's custom protocol so the release app
+# serves the EMBEDDED frontend. Without it, `dev = !custom-protocol` is true and
+# the app loads devUrl (http://localhost:1420) even in release -> blank/ERR page.
+# Build release with `--features custom-protocol`.
+custom-protocol = ["tauri/custom-protocol"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
