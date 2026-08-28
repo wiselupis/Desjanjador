@@ -170,6 +170,14 @@ pub fn run() {
     let shared_run = shared.clone();
 
     tauri::Builder::default()
+        // Single instance: a second launch just focuses the running one and exits,
+        // so startup never leaves a second exe running.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.show();
+                let _ = w.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_opener::init())
         .manage(shared.clone())
         .invoke_handler(tauri::generate_handler![
@@ -276,6 +284,20 @@ pub fn run() {
                 activate(&shared_setup);
             } else {
                 sysproxy::disable_if_ours(shared_setup.port);
+            }
+
+            // Autostart (launched with --tray) stays hidden in the tray; a manual
+            // launch shows the window. Explicit hide, since visible:false alone
+            // doesn't reliably keep the webview window hidden.
+            if let Some(w) = app.get_webview_window("main") {
+                let tray = std::env::args().any(|a| a == "--tray");
+                if tray {
+                    let _ = w.hide();
+                } else {
+                    let _ = w.show();
+                    let _ = w.set_focus();
+                }
+                log::log(&format!("window: tray-start={} visible={:?}", tray, w.is_visible()));
             }
 
             Ok(())

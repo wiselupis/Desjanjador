@@ -7,7 +7,7 @@ assinatura).
 
 ## Como usar
 
-1. Rode `install.ps1` (ou abra o `desjanjador.exe` direto).
+1. Dê dois cliques em **`Install.bat`** (veja "Rodar" abaixo).
 2. Ligue **Ativo** e espere a saída ficar pronta.
 3. **Reinicie o Discord** (Stable / PTB / Canary) — o gateway precisa nascer pela saída.
 4. Entre numa call de voz e teste o **Go Live / câmera**.

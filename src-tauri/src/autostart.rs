@@ -24,7 +24,8 @@ pub fn is_enabled() -> bool {
 #[cfg(windows)]
 pub fn enable() -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let tr = format!("\"{}\"", exe.display());
+    // "--tray" makes an autostarted instance stay in the tray (no window popup).
+    let tr = format!("\"{}\" --tray", exe.display());
     let out = schtasks(&[
         "/Create", "/TN", TASK, "/TR", &tr, "/SC", "ONLOGON", "/RL", "HIGHEST", "/F",
     ])

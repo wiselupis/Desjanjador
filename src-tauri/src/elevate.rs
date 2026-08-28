@@ -20,12 +20,18 @@ pub fn ensure_elevated() {
         .chain(std::iter::once(0))
         .collect();
     let verb: Vec<u16> = "runas".encode_utf16().chain(std::iter::once(0)).collect();
+    // Forward our args (e.g. --tray) to the elevated instance.
+    let params: String = std::env::args()
+        .skip(1)
+        .map(|a| format!("\"{a}\" "))
+        .collect();
+    let params_w: Vec<u16> = params.encode_utf16().chain(std::iter::once(0)).collect();
     unsafe {
         windows_sys::Win32::UI::Shell::ShellExecuteW(
             std::ptr::null_mut(),
             verb.as_ptr(),
             exe_w.as_ptr(),
-            std::ptr::null(),
+            params_w.as_ptr(),
             std::ptr::null(),
             1, // SW_SHOWNORMAL
         );
