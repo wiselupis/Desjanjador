@@ -6,11 +6,14 @@ interface ExitInfo {
   addr: string;
   ip: string;
   country: string;
+  latency_ms: number;
 }
 
 interface Status {
   active: boolean;
   autostart: boolean;
+  proxy_api: boolean;
+  use_tor: boolean;
   status: string;
   exit: ExitInfo | null;
   port: number;
@@ -68,6 +71,7 @@ export default function App() {
   const [acting, setActing] = useState(false);
   const [update, setUpdate] = useState<UpdateInfo | null>(null);
   const [updating, setUpdating] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
 
   const refresh = useCallback(async () => {
     try {
@@ -109,6 +113,33 @@ export default function App() {
       console.error(e);
     }
     refresh();
+  };
+
+  const toggleApi = async (v: boolean) => {
+    try {
+      setS(await invoke<Status>("set_proxy_api", { on: v }));
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  const toggleTor = async (v: boolean) => {
+    try {
+      setS(await invoke<Status>("set_use_tor", { on: v }));
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  const doRefreshExit = async () => {
+    setRefreshing(true);
+    try {
+      setS(await invoke<Status>("refresh_exit"));
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setTimeout(() => setRefreshing(false), 900);
+    }
   };
 
   const installBD = async () => {
@@ -186,13 +217,39 @@ export default function App() {
           checked={s?.autostart ?? false}
           onChange={toggleAuto}
         />
+        <div className="divider" />
+        <Toggle
+          label="Desbloquear canais +18"
+          hint="Roteia também a API do Discord (as ações podem ficar um pouco mais lentas)"
+          checked={s?.proxy_api ?? false}
+          onChange={toggleApi}
+        />
+        <div className="divider" />
+        <Toggle
+          label="Usar Tor (opcional)"
+          hint="Se você tiver o Tor aberto, usa como saída reserva. Desligado por padrão."
+          checked={s?.use_tor ?? false}
+          onChange={toggleTor}
+        />
       </section>
 
       <section className={`status ${active ? "status-on" : ""}`}>
-        <div className="status-line">{busy ? "processando…" : s?.status ?? "…"}</div>
+        <div className="status-top">
+          <div className="status-line">{busy ? "processando…" : s?.status ?? "…"}</div>
+          <button
+            className={`refresh ${refreshing ? "spin" : ""}`}
+            title="Trocar de saída"
+            aria-label="Trocar de saída"
+            disabled={!active || refreshing}
+            onClick={doRefreshExit}
+          >
+            ↻
+          </button>
+        </div>
         {s?.exit ? (
           <div className="exit">
             saída <b>{s.exit.country}</b> · {s.exit.ip}
+            {s.exit.latency_ms > 0 && <span className="lat"> · {s.exit.latency_ms} ms</span>}
             <span className="mono"> ({s.exit.addr})</span>
           </div>
         ) : (
@@ -209,8 +266,9 @@ export default function App() {
           <li>Entre numa call de voz e teste o Go&nbsp;Live / câmera.</li>
         </ol>
         <span className="tip">
-          A saída é escolhida automaticamente entre proxies rápidos, em países onde o
-          Discord funciona sem verificação de idade — e troca sozinha se cair.
+          Saída automática entre proxies rápidos em países sem verificação de idade;
+          mantém reservas testadas e troca sozinha se cair. O Tor é opcional
+          (ligue acima se quiser usá-lo como reserva).
         </span>
       </section>
 

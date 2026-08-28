@@ -41,15 +41,26 @@ body {
 }
 
 /* The scrolling middle. flex:1 + min-height:0 lets it absorb any window/DPI
-   size change and clip its own overflow, so the footer (Sair) stays pinned to
-   the bottom instead of jumping when the viewport is shorter than the design. */
+   size change; overflow-y:auto means at high zoom / large accessibility text it
+   scrolls (a thin, contained scrollbar) instead of clipping, while the footer
+   (Sair) stays pinned to the bottom. At normal scale it fits and shows no bar. */
 .content {
   flex: 1 1 auto;
   min-height: 0;
   display: flex;
   flex-direction: column;
-  gap: 10px;
-  overflow: hidden;
+  gap: 6px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  scrollbar-width: thin;
+  scrollbar-color: var(--line) transparent;
+}
+.content::-webkit-scrollbar {
+  width: 8px;
+}
+.content::-webkit-scrollbar-thumb {
+  background: var(--line);
+  border-radius: 4px;
 }
 
 .mascot {
@@ -103,7 +114,7 @@ body {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 11px 0;
+  padding: 8px 0;
   gap: 12px;
 }
 
@@ -164,8 +175,45 @@ body {
 .status-on {
   border-color: #2b3550;
 }
+.status-top {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+}
+.refresh {
+  flex: none;
+  background: transparent;
+  color: var(--muted);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  width: 26px;
+  height: 22px;
+  padding: 0;
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s;
+}
+.refresh:hover:not(:disabled) {
+  color: var(--fg);
+  border-color: var(--accent);
+}
+.refresh:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.refresh.spin {
+  animation: spin 0.9s linear infinite;
+}
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
 .status-line {
   color: var(--fg);
+  flex: 1;
 }
 .exit {
   color: var(--muted);
@@ -175,6 +223,10 @@ body {
 }
 .exit.muted {
   opacity: 0.7;
+}
+.lat {
+  color: var(--accent, #6fbf73);
+  font-variant-numeric: tabular-nums;
 }
 .mono,
 .port {
@@ -192,7 +244,7 @@ body {
   justify-content: space-between;
   font-size: 13px;
   font-weight: 600;
-  margin-bottom: 10px;
+  margin-bottom: 7px;
 }
 .mods {
   display: flex;
@@ -244,7 +296,7 @@ body {
   background: var(--card2);
   border: 1px solid var(--line);
   border-radius: 12px;
-  padding: 8px 14px;
+  padding: 7px 14px;
   font-size: 11.5px;
   color: var(--muted);
 }
@@ -252,7 +304,7 @@ body {
   color: var(--fg);
 }
 .help ol {
-  margin: 6px 0 4px;
+  margin: 4px 0 2px;
   padding-left: 18px;
   display: flex;
   flex-direction: column;

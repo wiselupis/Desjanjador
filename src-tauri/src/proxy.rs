@@ -10,7 +10,7 @@
 //! we fall back to a direct connection so Discord always opens (the fallback lives
 //! here, never in the PAC, so Chromium can't silently prefer DIRECT).
 
-use crate::state::{ExitInfo, Shared};
+use crate::state::{ExitInfo, Shared, TOR_PASS, TOR_USER};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -39,10 +39,21 @@ const DIRECT_TIMEOUT: Duration = Duration::from_secs(8);
 /// this), so it's never starved to a sub-second timeout and then wrongly cleared.
 const MIN_DIAL: Duration = Duration::from_secs(2);
 
-pub fn pac_body(port: u16) -> String {
+pub fn pac_body(port: u16, proxy_api: bool) -> String {
+    // Always route the gateway (*.discord.gg — the Go Live/camera region gate). If
+    // proxy_api is ON, ALSO route the REST API HOSTS of the three desktop clients
+    // (discord.com / ptb.discord.com / canary.discord.com — the age/ID-verification
+    // jurisdiction gate for age-restricted channels), and NOTHING else — so
+    // high-volume real-time events (gateway) and media (the CDN on *.discordapp.com/
+    // .net, never matched) stay direct and fast.
+    let api = if proxy_api {
+        "\n      || host == \"discord.com\" || host == \"ptb.discord.com\" || host == \"canary.discord.com\""
+    } else {
+        ""
+    };
     format!(
         "function FindProxyForURL(url, host){{\n  \
-if (host == \"gateway.discord.gg\" || dnsDomainIs(host, \".discord.gg\"))\n    \
+if (host == \"discord.gg\" || dnsDomainIs(host, \".discord.gg\"){api})\n    \
 return \"PROXY 127.0.0.1:{port}\";\n  \
 return \"DIRECT\";\n}}"
     )
@@ -99,7 +110,7 @@ async fn handle_conn(mut client: TcpStream, shared: Arc<Shared>) -> std::io::Res
         };
         handle_connect(client, shared, host, port).await
     } else if method.eq_ignore_ascii_case("GET") && target.starts_with("/proxy.pac") {
-        let body = pac_body(shared.port);
+        let body = pac_body(shared.port, shared.proxy_api.load(Ordering::SeqCst));
         let resp = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/x-ns-proxy-autoconfig\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
             body.len(),
@@ -126,8 +137,13 @@ async fn handle_connect(
     host: String,
     port: u16,
 ) -> std::io::Result<()> {
-    let is_gateway = host == "gateway.discord.gg" || host.ends_with(".discord.gg");
-    let upstream: Option<Upstream> = if is_gateway {
+    // Route the gateway (*.discord.gg) always; route the REST API hosts only when
+    // the user enabled proxy_api. Everything else (incl. the CDN) goes direct.
+    let is_gateway = host == "discord.gg" || host.ends_with(".discord.gg");
+    let is_api =
+        host == "discord.com" || host == "ptb.discord.com" || host == "canary.discord.com";
+    let route = is_gateway || (is_api && shared.proxy_api.load(Ordering::SeqCst));
+    let upstream: Option<Upstream> = if route {
         gateway_upstream(&shared, &host, port).await
     } else {
         connect_direct(&host, port, DIRECT_TIMEOUT)
@@ -188,12 +204,17 @@ async fn gateway_upstream(shared: &Arc<Shared>, host: &str, port: u16) -> Option
         // starved to a sub-second timeout and then wrongly cleared below.
         let left = overall.saturating_duration_since(Instant::now());
         let dial = left.min(EXIT_TIMEOUT).max(MIN_DIAL);
-        match tokio::time::timeout(
-            dial,
-            Socks5Stream::connect(e.addr.as_str(), (host, port)),
-        )
-        .await
-        {
+        // Local Tor (127.0.0.1) is dialed WITH the fixed credentials so its stream
+        // shares the same circuit (exit country) we validated; free proxies use none.
+        let connect = async {
+            if e.addr.starts_with("127.0.0.1:") {
+                Socks5Stream::connect_with_password(e.addr.as_str(), (host, port), TOR_USER, TOR_PASS)
+                    .await
+            } else {
+                Socks5Stream::connect(e.addr.as_str(), (host, port)).await
+            }
+        };
+        match tokio::time::timeout(dial, connect).await {
             Ok(Ok(s)) => {
                 crate::log::log(&format!(
                     "router: gateway {host} -> exit {} ({})",
@@ -202,18 +223,20 @@ async fn gateway_upstream(shared: &Arc<Shared>, host: &str, port: u16) -> Option
                 return Some(Upstream::Socks(s));
             }
             _ => {
-                // Instant make-before-break: promote the warm, pre-validated backup
-                // for THIS failed exit so the retry below routes through it with no
-                // wait — but never promote the SAME exit that just failed.
-                match shared.take_backup() {
+                // Instant make-before-break: promote the FASTEST warm backup for THIS
+                // failed exit so the retry below routes through it with no wait — but
+                // never promote the SAME exit that just failed.
+                match shared.take_fastest_backup() {
                     Some(b) if b.addr != e.addr => {
                         if shared.replace_exit_if(&e.addr, b.clone()) {
                             crate::log::log(&format!(
-                                "router: exit {} falhou -> promoveu reserva {} ({})",
-                                e.addr, b.ip, b.country
+                                "router: exit {} falhou -> promoveu reserva {} ({}, {}ms)",
+                                e.addr, b.ip, b.country, b.latency_ms
                             ));
                         } else {
-                            shared.set_backup(Some(b)); // health loop already swapped
+                            // Health loop already swapped the primary; return the
+                            // backup to the pool so it stays warm.
+                            shared.push_backup_if_active(b);
                         }
                     }
                     _ => {

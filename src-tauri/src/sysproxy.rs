@@ -9,8 +9,13 @@
 #[cfg(windows)]
 const INTERNET_SETTINGS: &str = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings";
 
+/// Bumped on every enable() so the AutoConfigURL changes each time we (re)apply it.
+#[cfg(windows)]
+static PAC_NONCE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
 #[cfg(windows)]
 pub fn enable(port: u16) -> Result<(), String> {
+    use std::sync::atomic::Ordering;
     use winreg::enums::HKEY_CURRENT_USER;
     use winreg::RegKey;
 
@@ -18,7 +23,11 @@ pub fn enable(port: u16) -> Result<(), String> {
     let (key, _) = hkcu
         .create_subkey(INTERNET_SETTINGS)
         .map_err(|e| e.to_string())?;
-    let url = format!("http://127.0.0.1:{port}/proxy.pac");
+    // A changing ?v= nonce forces Chromium/WinINET to RE-FETCH the PAC when we
+    // re-apply it (e.g. after toggling "route the API too"). An identical URL is
+    // deduped/cached, which is why the toggle otherwise silently did nothing.
+    let n = PAC_NONCE.fetch_add(1, Ordering::Relaxed);
+    let url = format!("http://127.0.0.1:{port}/proxy.pac?v={n}");
     key.set_value("AutoConfigURL", &url).map_err(|e| e.to_string())?;
     refresh();
     Ok(())
@@ -66,11 +75,12 @@ pub fn disable_if_ours(port: u16) {
     use winreg::enums::HKEY_CURRENT_USER;
     use winreg::RegKey;
 
+    // Match with or without the ?v= nonce so a leftover nonced URL is still cleaned.
     let ours = format!("http://127.0.0.1:{port}/proxy.pac");
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     if let Ok(key) = hkcu.open_subkey(INTERNET_SETTINGS) {
         if let Ok(cur) = key.get_value::<String, _>("AutoConfigURL") {
-            if cur == ours {
+            if cur.starts_with(&ours) {
                 let _ = disable();
             }
         }

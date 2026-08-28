@@ -26,6 +26,13 @@ fn activate(shared: &Arc<Shared>) {
         return; // already active
     }
     log::log("lifecycle: activate");
+    // Load the "route the API too" + "use Tor" preferences so the PAC/router/pool honor them.
+    {
+        let dir = shared.config_dir.lock().unwrap().clone();
+        let s = settings::load(&dir);
+        shared.proxy_api.store(s.proxy_api, Ordering::SeqCst);
+        shared.use_tor.store(s.use_tor, Ordering::SeqCst);
+    }
     let (tx, rx) = tokio::sync::watch::channel(false);
     *shared.stop_tx.lock().unwrap() = Some(tx);
 
@@ -51,11 +58,16 @@ fn activate(shared: &Arc<Shared>) {
         let sh = shared.clone();
         let mut rx_pool = rx.clone();
         tauri::async_runtime::spawn(async move {
-            // Warm start: seed the maintainer with the last working exit so the
-            // first discovery re-tries it concurrently (usually an instant reconnect).
-            let cached = {
+            // Warm start: seed the maintainer with the last session's best exits so the
+            // first discovery re-tries them IN PARALLEL (usually an instant reconnect,
+            // plus a pre-warmed pool from the runners-up).
+            let cached: Vec<String> = {
                 let dir = sh.config_dir.lock().unwrap().clone();
-                settings::load(&dir).last_exit.map(|e| e.addr)
+                settings::load(&dir)
+                    .last_exits
+                    .into_iter()
+                    .map(|e| e.addr)
+                    .collect()
             };
             let mut maint = pool::Maint::new(cached);
             loop {
@@ -82,7 +94,8 @@ fn deactivate(shared: &Arc<Shared>) {
     }
     let _ = sysproxy::disable();
     shared.set_exit(None);
-    shared.set_backup(None);
+    shared.clear_backups();
+    shared.set_refresh_avoid(Vec::new()); // don't leak a pending refresh exclusion into next start
     shared.set_status("parado");
 }
 
@@ -108,6 +121,8 @@ fn status_dto(_app: &AppHandle, shared: &Shared) -> StatusDto {
     StatusDto {
         active: shared.active.load(Ordering::SeqCst),
         autostart: shared.autostart.load(Ordering::SeqCst),
+        proxy_api: shared.proxy_api.load(Ordering::SeqCst),
+        use_tor: shared.use_tor.load(Ordering::SeqCst),
         status: shared.status.lock().unwrap().clone(),
         exit: shared.get_exit(),
         port: shared.port,
@@ -130,6 +145,66 @@ fn set_active(app: AppHandle, shared: State<Arc<Shared>>, on: bool) -> StatusDto
     }
     let dir = shared.config_dir.lock().unwrap().clone();
     settings::save_active(&dir, on);
+    status_dto(&app, &shared)
+}
+
+/// Toggle also-route-the-API. Re-applies the system PAC so Chromium reloads it
+/// with (or without) the extra Discord API hosts.
+#[tauri::command]
+fn set_proxy_api(app: AppHandle, shared: State<Arc<Shared>>, on: bool) -> StatusDto {
+    shared.proxy_api.store(on, Ordering::SeqCst);
+    let dir = shared.config_dir.lock().unwrap().clone();
+    settings::save_proxy_api(&dir, on);
+    if shared.active.load(Ordering::SeqCst) {
+        let _ = sysproxy::enable(shared.port);
+    }
+    status_dto(&app, &shared)
+}
+
+/// Toggle the opt-in Tor fallback. Takes effect on the next discovery/rotation; if
+/// the user turns it OFF while a Tor exit is serving, drop it so the pool moves to a
+/// country-pinned free proxy.
+#[tauri::command]
+fn set_use_tor(app: AppHandle, shared: State<Arc<Shared>>, on: bool) -> StatusDto {
+    shared.use_tor.store(on, Ordering::SeqCst);
+    let dir = shared.config_dir.lock().unwrap().clone();
+    settings::save_use_tor(&dir, on);
+    if !on {
+        // Drop only Tor-labelled entries (addr 127.0.0.1:*), keeping healthy free
+        // backups, then re-discover if we just dropped the serving exit.
+        for b in shared.get_backups() {
+            if b.addr.starts_with("127.0.0.1:") {
+                shared.remove_backup(&b.addr);
+            }
+        }
+        let dropped_primary = shared
+            .get_exit()
+            .map_or(false, |e| e.addr.starts_with("127.0.0.1:"));
+        if dropped_primary {
+            shared.set_exit(None);
+        }
+        if dropped_primary && shared.active.load(Ordering::SeqCst) {
+            shared.refresh_now.notify_one();
+        }
+    }
+    status_dto(&app, &shared)
+}
+
+/// Force a fresh exit now (user tapped the refresh icon): drop the primary +
+/// backup and wake the pool to rediscover.
+#[tauri::command]
+fn refresh_exit(app: AppHandle, shared: State<Arc<Shared>>) -> StatusDto {
+    if shared.active.load(Ordering::SeqCst) {
+        // Remember what we're dropping so the next discovery doesn't just hand back
+        // the same exit(s) — refresh must give a genuinely different one.
+        let mut avoid: Vec<String> = shared.get_exit().map(|e| e.addr).into_iter().collect();
+        avoid.extend(shared.get_backups().into_iter().map(|b| b.addr));
+        shared.set_refresh_avoid(avoid);
+        shared.set_exit(None);
+        shared.clear_backups();
+        shared.set_status("atualizando saída…");
+        shared.refresh_now.notify_one();
+    }
     status_dto(&app, &shared)
 }
 
@@ -214,6 +289,9 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_status,
             set_active,
+            set_proxy_api,
+            set_use_tor,
+            refresh_exit,
             set_autostart,
             exit_app,
             detect_clients,
@@ -236,7 +314,7 @@ pub fn run() {
             // window title (fixes the truncated "Desjanjado" in the title bar).
             updater::cleanup_old();
             if let Some(w) = app.get_webview_window("main") {
-                let _ = w.set_title("Desjanjador");
+                let _ = w.set_title(&format!("Desjanjador v{}", env!("CARGO_PKG_VERSION")));
             }
 
             // DESJANJADOR_AUTOUPDATE=1 applies an available update silently (no
