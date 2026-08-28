@@ -162,22 +162,30 @@ async fn apply_update(
 
 // ---------- run ----------
 
+/// Kill any other running instance so a new launch replaces the old one
+/// (never two at once).
+#[cfg(windows)]
+fn kill_other_instances() {
+    use std::os::windows::process::CommandExt;
+    let pid = std::process::id();
+    let _ = std::process::Command::new("taskkill")
+        .args(["/IM", "desjanjador.exe", "/F", "/FI", &format!("PID ne {pid}")])
+        .creation_flags(0x08000000)
+        .output();
+}
+#[cfg(not(windows))]
+fn kill_other_instances() {}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     elevate::ensure_elevated();
+    kill_other_instances();
     let shared = Arc::new(Shared::new(PORT));
     let shared_setup = shared.clone();
     let shared_run = shared.clone();
 
     tauri::Builder::default()
-        // Single instance: a second launch just focuses the running one and exits,
-        // so startup never leaves a second exe running.
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            if let Some(w) = app.get_webview_window("main") {
-                let _ = w.show();
-                let _ = w.set_focus();
-            }
-        }))
+        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_opener::init())
         .manage(shared.clone())
         .invoke_handler(tauri::generate_handler![
@@ -298,6 +306,29 @@ pub fn run() {
                     let _ = w.set_focus();
                 }
                 log::log(&format!("window: tray-start={} visible={:?}", tray, w.is_visible()));
+            }
+
+            // Autostart (tray) launch: quietly notify about updates instead of
+            // popping the in-window dialog. The dialog still appears if the user
+            // opens the window.
+            if std::env::args().any(|a| a == "--tray") {
+                let h = handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Ok(info) = updater::check().await {
+                        if info.available {
+                            use tauri_plugin_notification::NotificationExt;
+                            let _ = h
+                                .notification()
+                                .builder()
+                                .title("Desjanjador")
+                                .body(format!(
+                                    "Nova versão {} disponível — abra o app para atualizar.",
+                                    info.version
+                                ))
+                                .show();
+                        }
+                    }
+                });
             }
 
             Ok(())
