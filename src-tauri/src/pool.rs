@@ -1,41 +1,61 @@
-//! Free-proxy pool: fetch, rank, and validate SOCKS5 exits.
+//! Free-proxy pool: fetch, rank, validate, and keep two warm SOCKS5 exits.
 //!
-//! Validation is also our MITM/credential defense. For each candidate we make a
-//! real TLS request to Cloudflare's trace through the proxy. Success proves, in
-//! one shot: the tunnel works, the certificate is valid (schannel would reject a
-//! MITM), and it reveals the true exit IP + country. We only accept non-BR exits
-//! and prefer privacy-friendly countries (US first). Port 4145 is dropped — it is
-//! overwhelmingly SOCKS4 relays that intercept TLS.
+//! Validation is also our MITM/credential defense: for each candidate we make a
+//! real TLS request to Cloudflare's trace through the proxy. Success proves in one
+//! shot that the tunnel works, the certificate is valid (a MITM would be rejected),
+//! and reveals the true exit IP + country. We accept an exit ONLY if its true
+//! country is in ALLOWED. Among allowed exits we rank purely by reliability
+//! (latency/uptime). Port 4145 is dropped (SOCKS4 relays that intercept TLS).
+//!
+//! A PRIMARY exit serves the router; a warm, pre-validated BACKUP is kept ready so
+//! a dead/degraded primary is swapped instantly (make-before-break, no user gap).
 
 use crate::state::{ExitInfo, Shared};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::net::TcpStream;
 
-/// Country preference order (best first). Anything non-BR that validates is
-/// still accepted, just ranked lower.
-const PREFERRED: &[&str] = &[
-    "US", "CA", "NL", "CH", "DE", "SE", "GB", "FR", "FI", "IE", "IS", "LU", "NO", "AT",
+/// Countries safe to exit through: Discord voice/Go-Live AND age-restricted (NSFW)
+/// channels work there with NO government block and NO IP-triggered age/ID
+/// verification (the gateway's exit IP is Discord's effective jurisdiction), as of
+/// Aug 2026 — researched + adversarially verified. Excludes blocked countries
+/// (CN/RU/IR/UAE/EG/TR/…) and the IP-triggered age-verification ones: GB, AU, BR,
+/// and the US (Texas/Utah have live age checks and an IP can't be pinned to a safe
+/// state). Watch-items to revisit: GR's law takes effect 2027; DK/FR have pending
+/// bills.
+const ALLOWED: &[&str] = &[
+    "TH", "FR", "DE", "IE", "IT", "NL", "BE", "PL", "CZ", "AT", "SE", "FI", "NO", "DK",
+    "PT", "RO", "GR", "CH", "CA", "MX", "AR", "CL", "CO", "UY", "NZ", "JP", "TW", "HK",
+    "IN", "PH", "SG", "IL", "ZA", "NG", "KE", "UA", "MD", "GE", "AM", "LK",
 ];
 
-/// Timeout for DISCOVERY of a candidate (a full TLS request to Cloudflare through
-/// the proxy — this is also our MITM/country check). Kept short so dead
-/// candidates are rejected fast while scanning many.
+/// Timeout for DISCOVERY of a candidate (full TLS to Cloudflare through the proxy —
+/// also our MITM/country check). Short so dead candidates are rejected fast.
 const VALIDATE_TIMEOUT: Duration = Duration::from_secs(7);
-/// GENEROUS timeout for the keep-warm HEALTH re-check of the one held exit. It
-/// runs the SAME full-TLS validation (so it still catches an exit that accepts a
-/// tunnel but mangles/RSTs the payload — a bare CONNECT check would miss that),
-/// just with a lenient budget so a working-but-slow exit isn't dropped each cycle.
+/// GENEROUS timeout for the keep-warm HEALTH probe of the primary — same full-TLS
+/// validation (catches a tunnel that mangles/RSTs the payload), but lenient so a
+/// slow-but-working exit isn't churned.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
-/// Consecutive failed health probes before the held exit is dropped. One blip is
-/// tolerated (stability over churn); free proxies have very spiky latency.
+/// A primary whose health probe is slower than this counts as DEGRADING and is
+/// rotated to the fresh warm backup before it fully dies. Kept ABOVE the accept
+/// timeout (VALIDATE_TIMEOUT=7s) so an exit that just validated isn't judged
+/// degraded on its next probe — that mismatch would churn spiky free proxies.
+const DEGRADE_MS: u128 = 10_000;
+/// Consecutive bad probes before rotating the primary. One blip is tolerated
+/// (stability over churn); free proxies have very spiky latency.
 const GRACE: u8 = 2;
-/// Re-hit the free-proxy providers at most this often. Between fetches we
-/// re-validate the cached candidate list, so a prolonged no-exit state never
+/// Re-hit the free-proxy providers at most this often; between fetches we
+/// re-validate the cached candidate list so a prolonged no-exit state never
 /// hammers ProxyScrape/Geonode from the user's real IP (their APIs rate-limit).
 const FETCH_TTL: Duration = Duration::from_secs(180);
+/// Overall wall-clock cap on a validate-race (discovery or backup refill) so an
+/// all-dead candidate list can't block the health loop for ~50s.
+const RACE_DEADLINE: Duration = Duration::from_secs(12);
 const BATCH: usize = 16;
+
+fn allowed(country: &str) -> bool {
+    ALLOWED.contains(&country)
+}
 
 struct Cand {
     addr: String,
@@ -68,43 +88,119 @@ impl Maint {
     }
 }
 
-/// One maintenance pass, run on a ~30s cadence and whenever the router signals a
-/// dead exit via `refresh_now`:
-///   - if we hold an exit, health-probe it (with a small grace so one blip
-///     doesn't churn a working exit);
-///   - otherwise discover and publish a fresh one.
-/// This is what keeps a LIVE exit ready before Discord next reconnects — without
-/// it, a stale exit sits around until a gateway connection eats the router
-/// timeout and falls open to a direct (blocked) connection.
+/// One maintenance pass (~20s cadence, or on `refresh_now`): keep the PRIMARY
+/// healthy and a warm BACKUP ready.
+///   1. Probe the primary; on death OR degradation (after a small grace), swap to
+///      the pre-validated backup INSTANTLY (make-before-break, no user gap), or
+///      discover a fresh one if no backup is ready.
+///   2. Top the backup up (a different exit) while the primary keeps serving, so
+///      the next swap is seamless.
 pub async fn maintain(shared: Arc<Shared>, m: &mut Maint) {
     if !shared.active.load(Ordering::SeqCst) {
         return;
     }
-    if let Some(cur) = shared.get_exit() {
-        if probe_exit(&cur.addr).await {
-            m.fails = 0;
-            return; // still carries the gateway — keep it
+    ensure_candidates(m).await;
+
+    // 1) Primary health / rotation.
+    match shared.get_exit() {
+        Some(cur) => {
+            let good = matches!(probe_timed(&cur.addr).await, Some(ms) if ms < DEGRADE_MS);
+            if good {
+                m.fails = 0;
+            } else {
+                m.fails += 1;
+                crate::log::log(&format!(
+                    "pool: primary {} ruim ({}/{})",
+                    cur.addr, m.fails, GRACE
+                ));
+                if m.fails >= GRACE {
+                    m.fails = 0;
+                    if !shared.active.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    match shared.take_backup() {
+                        // Make-before-break: swap to the warm, pre-validated backup
+                        // (but never to the same exit that just failed).
+                        Some(b) if b.addr != cur.addr => {
+                            crate::log::log(&format!(
+                                "pool: rotacionou {} -> reserva {} ({})",
+                                cur.addr, b.ip, b.country
+                            ));
+                            if shared.set_exit_if_active(b.clone()) {
+                                shared.set_status(format!(
+                                    "saída pronta: {} · {} (troca automática)",
+                                    b.country, b.ip
+                                ));
+                                let dir = shared.config_dir.lock().unwrap().clone();
+                                crate::settings::save_last_exit(&dir, Some(b));
+                            }
+                        }
+                        // No usable backup (empty, or it was the same dead exit):
+                        // clear + rediscover (a brief gap).
+                        _ => {
+                            shared.clear_exit_if(&cur.addr);
+                            shared.set_status("saída caiu — procurando outra…");
+                            discover(shared.clone(), m).await;
+                        }
+                    }
+                }
+            }
         }
-        m.fails += 1;
-        crate::log::log(&format!(
-            "pool: probe da saída {} falhou ({}/{})",
-            cur.addr, m.fails, GRACE
-        ));
-        if m.fails < GRACE {
-            return; // tolerate a transient blip
-        }
-        m.fails = 0;
-        if !shared.active.load(Ordering::SeqCst) {
-            return; // deactivated while probing — don't touch state
-        }
-        crate::log::log(&format!("pool: saída {} caiu -> procurando outra", cur.addr));
-        shared.clear_exit_if(&cur.addr);
-        shared.set_status("saída caiu — procurando outra…");
+        None => discover(shared.clone(), m).await,
     }
-    discover(shared, m).await;
+
+    // 2) Keep the warm backup healthy, distinct, and topped up so the next swap is
+    //    instant. Runs while the primary keeps serving.
+    if !shared.active.load(Ordering::SeqCst) {
+        return;
+    }
+    // Never let the backup equal the primary — a collision makes a swap a no-op.
+    if let (Some(p), Some(b)) = (shared.get_exit(), shared.get_backup()) {
+        if p.addr == b.addr {
+            shared.set_backup(None);
+        }
+    }
+    // Re-validate a held backup so a stale/dead one is dropped (free proxies die
+    // within minutes; an unchecked backup could be dead when promoted, defeating
+    // the "no gap" swap).
+    if let Some(b) = shared.get_backup() {
+        if probe_timed(&b.addr).await.is_none() {
+            crate::log::log(&format!("pool: reserva {} caiu", b.addr));
+            shared.set_backup(None);
+        }
+    }
+    // Refill if empty, choosing a DIFFERENT exit from the primary.
+    if shared.get_backup().is_none() {
+        if let Some(p) = shared.get_exit() {
+            let excl = [p.addr.clone()];
+            if let Some(b) = race_validate(&m.cand_addrs, &excl).await {
+                if shared.get_backup().is_none()
+                    && shared.get_exit().map_or(false, |p| p.addr != b.addr)
+                {
+                    crate::log::log(&format!("pool: reserva pronta {} ({})", b.ip, b.country));
+                    shared.set_backup_if_active(b);
+                }
+            }
+        }
+    }
 }
 
-/// Find and publish a fresh exit: race local Tor against the (cached) free list.
+/// Refresh the cached candidate list from the providers at most every FETCH_TTL
+/// (fetched_at=None counts as stale). Gated on staleness ALONE (never on
+/// is_empty()), so an empty result (providers rate-limited) doesn't force an
+/// immediate refetch that would feed the rate-limit loop.
+async fn ensure_candidates(m: &mut Maint) {
+    let stale = m.fetched_at.map_or(true, |t| t.elapsed() >= FETCH_TTL);
+    if stale {
+        let cands = fetch_candidates().await;
+        crate::log::log(&format!("pool: {} candidatos (cache)", cands.len()));
+        m.cand_addrs = cands.into_iter().map(|c| c.addr).collect();
+        m.fetched_at = Some(Instant::now());
+    }
+}
+
+/// Find and publish a fresh PRIMARY exit: race the cached last-working exit
+/// against the free-proxy list; the first that validates wins.
 async fn discover(shared: Arc<Shared>, m: &mut Maint) {
     if !shared.active.load(Ordering::SeqCst) {
         return;
@@ -113,26 +209,11 @@ async fn discover(shared: Arc<Shared>, m: &mut Maint) {
     let t0 = Instant::now();
     crate::log::log("pool: procurando saída");
     shared.set_status("procurando uma saída rápida fora do Brasil…");
-
-    // Refresh the candidate list from the providers at most every FETCH_TTL
-    // (fetched_at=None counts as stale, so the first pass always fetches). Gate on
-    // staleness ALONE — never on cand_addrs.is_empty() — so an EMPTY result
-    // (providers rate-limited/down) does not force an immediate refetch next
-    // cycle, which would feed the very rate-limit loop this cache exists to avoid.
-    // An empty list simply means no exit this pass; we back off for FETCH_TTL.
-    let stale = m.fetched_at.map_or(true, |t| t.elapsed() >= FETCH_TTL);
-    if stale {
-        let cands = fetch_candidates().await;
-        crate::log::log(&format!("pool: {} candidatos (cache atualizado)", cands.len()));
-        m.cand_addrs = cands.into_iter().map(|c| c.addr).collect();
-        m.fetched_at = Some(Instant::now());
-    }
     let addrs = m.cand_addrs.clone();
 
-    // Race, all concurrently — the first valid exit wins and is published
-    // immediately (the router picks it up); publish_if_first keeps whichever lands
-    // first: (1) the cached last-working exit — usually the fastest, an instant
-    // reconnect; (2) local Tor if present; (3) the free-proxy list.
+    // Race the cached last-working exit against the free list; publish_if_first
+    // keeps whichever validates first (the cached one is usually fastest — an
+    // instant reconnect).
     let cached_task = m.cached.take().map(|addr| {
         let sh = shared.clone();
         tokio::spawn(async move {
@@ -141,20 +222,7 @@ async fn discover(shared: Arc<Shared>, m: &mut Maint) {
             }
         })
     });
-    let tor_task = {
-        let sh = shared.clone();
-        tokio::spawn(async move {
-            match try_tor().await {
-                Some(tor) => publish_if_first(&sh, tor, "Tor"),
-                None => crate::log::log("pool: nenhum Tor local acessível"),
-            }
-        })
-    };
-    let free_task = {
-        let sh = shared.clone();
-        tokio::spawn(async move { free_search(sh, addrs).await })
-    };
-    let _ = tokio::join!(tor_task, free_task);
+    free_search(shared.clone(), addrs).await;
     if let Some(t) = cached_task {
         let _ = t.await;
     }
@@ -173,99 +241,76 @@ async fn discover(shared: Arc<Shared>, m: &mut Maint) {
     }
 }
 
-/// Keep-warm liveness probe for the one held exit. Runs the SAME full-TLS
-/// validation as discovery — so it catches an exit that still accepts a tunnel
-/// but mangles/RSTs the payload (a bare CONNECT check would pass such a half-dead
-/// exit forever) — just with a generous timeout so a slow-but-working exit is not
-/// churned every cycle.
-async fn probe_exit(addr: &str) -> bool {
-    validate(addr, PROBE_TIMEOUT).await.is_some()
+/// Timed health probe of the primary: full-TLS validate through the exit (catches
+/// a tunnel that mangles the payload, and re-checks the country is still allowed),
+/// returning its latency in ms, or None if it fails. None or a high ms => rotate.
+async fn probe_timed(addr: &str) -> Option<u128> {
+    let t = Instant::now();
+    validate(addr, PROBE_TIMEOUT).await.map(|_| t.elapsed().as_millis())
 }
 
-/// Publish an exit if we don't have one yet, or upgrade to a US exit.
+/// Validate candidate addrs concurrently (up to BATCH in flight), returning the
+/// FIRST that validates and whose addr is not in `exclude` — aborting the rest.
+/// validate() already enforces the allowlisted-country + no-MITM checks. Used to
+/// fill the warm backup without disturbing the serving primary.
+async fn race_validate(addrs: &[String], exclude: &[String]) -> Option<ExitInfo> {
+    use tokio::task::JoinSet;
+    let deadline = Instant::now() + RACE_DEADLINE;
+    let list: Vec<String> = addrs
+        .iter()
+        .filter(|a| !exclude.iter().any(|x| x == *a))
+        .cloned()
+        .collect();
+    let mut idx = 0usize;
+    let mut set: JoinSet<Option<ExitInfo>> = JoinSet::new();
+    while idx < list.len() && set.len() < BATCH {
+        let a = list[idx].clone();
+        idx += 1;
+        set.spawn(async move { validate(&a, VALIDATE_TIMEOUT).await });
+    }
+    while let Some(res) = set.join_next().await {
+        if let Ok(Some(info)) = res {
+            set.abort_all();
+            return Some(info);
+        }
+        if Instant::now() >= deadline {
+            set.abort_all(); // overall cap: don't block the health loop on a dead list
+            break;
+        }
+        if idx < list.len() {
+            let a = list[idx].clone();
+            idx += 1;
+            set.spawn(async move { validate(&a, VALIDATE_TIMEOUT).await });
+        }
+    }
+    None
+}
+
+/// Publish an exit as the PRIMARY if we don't already hold one. First valid wins —
+/// all allowed countries are equal, ranked only by reliability.
 fn publish_if_first(shared: &Shared, e: ExitInfo, via: &str) {
     let mut guard = shared.exit.lock().unwrap();
-    // Re-check active WHILE holding the exit lock. deactivate() flips active=false
-    // and then clears the exit under this same lock, so checking here serializes
-    // the two: a validate task finishing after stop either sees inactive and skips,
-    // or writes and deactivate's subsequent set_exit(None) removes it — never a
-    // live exit left behind for a stopped app.
+    // Re-check active WHILE holding the exit lock so it serializes with deactivate
+    // (which flips active=false then clears the exit under this same lock).
     if !shared.active.load(Ordering::SeqCst) {
         return;
     }
-    let take = match &*guard {
-        None => true,
-        Some(cur) => e.country == "US" && cur.country != "US",
-    };
-    if take {
+    if guard.is_none() {
         *guard = Some(e.clone());
         drop(guard);
-        crate::log::log(&format!("pool: exit selected via {via}: {} ({})", e.ip, e.country));
+        crate::log::log(&format!("pool: saída via {via}: {} ({})", e.ip, e.country));
         shared.set_status(format!("saída pronta: {} · {} (via {})", e.country, e.ip, via));
     }
 }
 
-/// Validate the (already-ranked, cached) candidate addrs, keeping up to BATCH
-/// checks in flight and STOPPING at the first success (aborting the rest) rather
-/// than waiting for every straggler — so a working exit lands as fast as any one
-/// proxy responds, not as slow as the slowest in a batch. Candidates are ranked
-/// US-first, so the first success is usually US anyway.
+/// Find and publish a PRIMARY exit from the free list: the first candidate that
+/// validates (allowed-country + no-MITM) wins. Excludes the current warm backup so
+/// the primary and backup can never collapse to the same exit.
 async fn free_search(shared: Arc<Shared>, addrs: Vec<String>) {
-    use tokio::task::JoinSet;
-    if addrs.is_empty() {
-        return;
+    let excl: Vec<String> = shared.get_backup().map(|b| vec![b.addr]).unwrap_or_default();
+    if let Some(info) = race_validate(&addrs, &excl).await {
+        publish_if_first(&shared, info, "free");
     }
-    let mut iter = addrs.into_iter();
-    let mut set: JoinSet<()> = JoinSet::new();
-    for _ in 0..BATCH {
-        match iter.next() {
-            Some(addr) => spawn_validate(&mut set, &shared, addr),
-            None => break,
-        }
-    }
-    while set.join_next().await.is_some() {
-        if shared.get_exit().is_some() {
-            set.abort_all();
-            break; // someone published — stop racing
-        }
-        if let Some(addr) = iter.next() {
-            spawn_validate(&mut set, &shared, addr); // keep the pipeline full
-        }
-    }
-}
-
-fn spawn_validate(set: &mut tokio::task::JoinSet<()>, shared: &Arc<Shared>, addr: String) {
-    let sh = shared.clone();
-    set.spawn(async move {
-        if let Some(info) = validate(&addr, VALIDATE_TIMEOUT).await {
-            publish_if_first(&sh, info, "free");
-        }
-    });
-}
-
-/// If a local Tor SOCKS port is up (Tor Browser 9150 or daemon 9050) and its
-/// exit is non-BR, return it as a preferred exit.
-async fn try_tor() -> Option<ExitInfo> {
-    for port in [9150u16, 9050u16, 9060u16, 9052u16, 9250u16] {
-        let addr = format!("127.0.0.1:{port}");
-        let reachable = tokio::time::timeout(Duration::from_millis(500), TcpStream::connect(&addr))
-            .await
-            .ok()
-            .and_then(|r| r.ok())
-            .is_some();
-        if !reachable {
-            continue;
-        }
-        if let Some(mut info) = validate(&addr, VALIDATE_TIMEOUT).await {
-            info.country = if info.country.is_empty() {
-                "Tor".into()
-            } else {
-                format!("Tor·{}", info.country)
-            };
-            return Some(info);
-        }
-    }
-    None
 }
 
 /// Validate one SOCKS5 proxy by doing a TLS request to Cloudflare's trace under
@@ -296,8 +341,8 @@ async fn validate(addr: &str, timeout: Duration) -> Option<ExitInfo> {
             loc = v.trim().to_string();
         }
     }
-    if loc.is_empty() || loc == "BR" {
-        return None; // must be a real, non-Brazilian exit
+    if loc.is_empty() || !allowed(&loc) {
+        return None; // only exit through an allowlisted country (see ALLOWED)
     }
     Some(ExitInfo {
         addr: addr.to_string(),
@@ -332,21 +377,19 @@ async fn fetch_candidates() -> Vec<Cand> {
         cands.retain(|c| seen.insert(c.addr.clone()));
     }
 
-    // Drop 4145 (SOCKS4 TLS-interception hotspot) and dead entries with no data.
+    // Drop 4145 (SOCKS4 TLS-interception hotspot).
     cands.retain(|c| !c.addr.ends_with(":4145"));
-
-    // Rank by RELIABILITY first (alive, then low latency, then high uptime) so we
-    // hit a working proxy fast regardless of country; the privacy-friendly country
-    // order is only a tiebreaker among equally-good ones. Any non-BR exit is
-    // accepted (see validate), so this only decides who we try first.
+    // Keep only candidates whose CLAIMED country is allowed or unknown (validate()
+    // enforces the TRUE country); this avoids wasting validations on clearly-
+    // disallowed proxies — the free lists are heavy on CN/RU/US.
+    cands.retain(|c| c.country.is_empty() || allowed(&c.country));
+    // Rank purely by reliability (alive, then low latency, then high uptime): any
+    // allowed country is equally fine, so we just want the fastest working one.
     cands.sort_by(|a, b| {
-        let ap = PREFERRED.iter().position(|c| *c == a.country).unwrap_or(99);
-        let bp = PREFERRED.iter().position(|c| *c == b.country).unwrap_or(99);
         b.alive
             .cmp(&a.alive)
             .then(a.timeout.partial_cmp(&b.timeout).unwrap_or(std::cmp::Ordering::Equal))
             .then(b.uptime.partial_cmp(&a.uptime).unwrap_or(std::cmp::Ordering::Equal))
-            .then(ap.cmp(&bp))
     });
     cands.truncate(120);
     cands

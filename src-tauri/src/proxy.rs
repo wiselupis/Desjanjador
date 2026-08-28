@@ -168,7 +168,7 @@ async fn handle_connect(
 /// one on the reconnect itself.
 async fn gateway_upstream(shared: &Arc<Shared>, host: &str, port: u16) -> Option<Upstream> {
     let overall = Instant::now() + GATEWAY_DEADLINE;
-    for attempt in 0..2u8 {
+    for _ in 0..2u8 {
         let left = overall.saturating_duration_since(Instant::now());
         if left.is_zero() {
             break;
@@ -202,16 +202,29 @@ async fn gateway_upstream(shared: &Arc<Shared>, host: &str, port: u16) -> Option
                 return Some(Upstream::Socks(s));
             }
             _ => {
-                crate::log::log(&format!(
-                    "router: exit {} lento/morto -> {}",
-                    e.addr,
-                    if attempt == 0 { "revalidar + tentar outra" } else { "DIRECT" }
-                ));
-                // Clear ONLY this exit (leave a fresh one the health loop may have
-                // just published), and kick a refresh to find a replacement.
-                shared.clear_exit_if(&e.addr);
+                // Instant make-before-break: promote the warm, pre-validated backup
+                // for THIS failed exit so the retry below routes through it with no
+                // wait — but never promote the SAME exit that just failed.
+                match shared.take_backup() {
+                    Some(b) if b.addr != e.addr => {
+                        if shared.replace_exit_if(&e.addr, b.clone()) {
+                            crate::log::log(&format!(
+                                "router: exit {} falhou -> promoveu reserva {} ({})",
+                                e.addr, b.ip, b.country
+                            ));
+                        } else {
+                            shared.set_backup(Some(b)); // health loop already swapped
+                        }
+                    }
+                    _ => {
+                        // No usable backup: clear ONLY this exit (leave a fresh one
+                        // the health loop may have published) and search.
+                        crate::log::log(&format!("router: exit {} lento/morto", e.addr));
+                        shared.clear_exit_if(&e.addr);
+                    }
+                }
                 shared.refresh_now.notify_one();
-                // Next iteration: wait_for_exit blocks (briefly) for the replacement.
+                // Next iteration: get_exit()/wait_for_exit picks up the replacement.
             }
         }
     }

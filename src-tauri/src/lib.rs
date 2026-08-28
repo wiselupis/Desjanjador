@@ -43,10 +43,10 @@ fn activate(shared: &Arc<Shared>) {
             proxy::run_router(sh, rx_router).await;
         });
     }
-    // Pool: find an exit now, then health-check it every 30s (a dead free proxy
-    // is dropped and replaced before Discord next reconnects), or immediately
-    // when the router signals a dead exit via `refresh_now`. `Maint` carries the
-    // grace counter + cached candidate list across passes.
+    // Pool: find a primary exit + a warm backup now, then health-check every 20s
+    // (a degrading/dead primary is swapped to the pre-validated backup before
+    // Discord notices), or immediately when the router signals a failure via
+    // `refresh_now`. `Maint` carries the grace counter + cached candidate list.
     {
         let sh = shared.clone();
         let mut rx_pool = rx.clone();
@@ -61,7 +61,7 @@ fn activate(shared: &Arc<Shared>) {
             loop {
                 pool::maintain(sh.clone(), &mut maint).await;
                 tokio::select! {
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {}
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(20)) => {}
                     _ = sh.refresh_now.notified() => {}
                     changed = rx_pool.changed() => {
                         if changed.is_err() || *rx_pool.borrow() { break; }
@@ -82,6 +82,7 @@ fn deactivate(shared: &Arc<Shared>) {
     }
     let _ = sysproxy::disable();
     shared.set_exit(None);
+    shared.set_backup(None);
     shared.set_status("parado");
 }
 

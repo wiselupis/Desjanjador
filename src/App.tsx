@@ -209,8 +209,8 @@ export default function App() {
           <li>Entre numa call de voz e teste o Go&nbsp;Live / câmera.</li>
         </ol>
         <span className="tip">
-          A saída é escolhida automaticamente entre proxies rápidos e confiáveis. O
-          Tor&nbsp;é só uma alternativa.
+          A saída é escolhida automaticamente entre proxies rápidos, em países onde o
+          Discord funciona sem verificação de idade — e troca sozinha se cair.
         </span>
       </section>
 
