@@ -165,6 +165,7 @@ export default function App() {
           e.currentTarget.style.display = "none";
         }}
       />
+      <div className="content">
       <header className="head">
         <h1>Desjanjador</h1>
         <span className={`dot ${active ? "live" : ""}`} />
@@ -233,6 +234,7 @@ export default function App() {
         </div>
         {action && <div className="action-msg">{action}</div>}
       </section>
+      </div>
 
       <button className="exit-btn" onClick={doExit}>
         Sair

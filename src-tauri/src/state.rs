@@ -61,4 +61,14 @@ impl Shared {
     pub fn get_exit(&self) -> Option<ExitInfo> {
         self.exit.lock().unwrap().clone()
     }
+
+    /// Clear the exit ONLY if it is still the one at `addr`. Prevents a slow
+    /// router connection from clobbering an exit the health loop already swapped
+    /// in for a fresh one.
+    pub fn clear_exit_if(&self, addr: &str) {
+        let mut g = self.exit.lock().unwrap();
+        if matches!(g.as_ref(), Some(e) if e.addr == addr) {
+            *g = None;
+        }
+    }
 }

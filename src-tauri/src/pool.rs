@@ -8,8 +8,9 @@
 //! overwhelmingly SOCKS4 relays that intercept TLS.
 
 use crate::state::{ExitInfo, Shared};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 
 /// Country preference order (best first). Anything non-BR that validates is
@@ -18,8 +19,23 @@ const PREFERRED: &[&str] = &[
     "US", "CA", "NL", "CH", "DE", "SE", "GB", "FR", "FI", "IE", "IS", "LU", "NO", "AT",
 ];
 
-const VALIDATE_TIMEOUT: Duration = Duration::from_secs(12);
-const BATCH: usize = 12;
+/// Timeout for DISCOVERY of a candidate (a full TLS request to Cloudflare through
+/// the proxy — this is also our MITM/country check). Kept short so dead
+/// candidates are rejected fast while scanning many.
+const VALIDATE_TIMEOUT: Duration = Duration::from_secs(7);
+/// GENEROUS timeout for the keep-warm HEALTH re-check of the one held exit. It
+/// runs the SAME full-TLS validation (so it still catches an exit that accepts a
+/// tunnel but mangles/RSTs the payload — a bare CONNECT check would miss that),
+/// just with a lenient budget so a working-but-slow exit isn't dropped each cycle.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+/// Consecutive failed health probes before the held exit is dropped. One blip is
+/// tolerated (stability over churn); free proxies have very spiky latency.
+const GRACE: u8 = 2;
+/// Re-hit the free-proxy providers at most this often. Between fetches we
+/// re-validate the cached candidate list, so a prolonged no-exit state never
+/// hammers ProxyScrape/Geonode from the user's real IP (their APIs rate-limit).
+const FETCH_TTL: Duration = Duration::from_secs(180);
+const BATCH: usize = 16;
 
 struct Cand {
     addr: String,
@@ -29,37 +45,118 @@ struct Cand {
     timeout: f64,
 }
 
-/// Fetch + validate; publishes the best exit into shared state as it goes.
-pub async fn refresh_pool(shared: Arc<Shared>) {
-    crate::log::log("pool: refresh start");
+/// Loop-owned state for the keep-warm maintainer (health grace counter + cached
+/// provider candidate list, so we don't re-fetch the providers every cycle).
+#[derive(Default)]
+pub struct Maint {
+    fails: u8,
+    cand_addrs: Vec<String>,
+    fetched_at: Option<Instant>,
+}
+
+/// One maintenance pass, run on a ~30s cadence and whenever the router signals a
+/// dead exit via `refresh_now`:
+///   - if we hold an exit, health-probe it (with a small grace so one blip
+///     doesn't churn a working exit);
+///   - otherwise discover and publish a fresh one.
+/// This is what keeps a LIVE exit ready before Discord next reconnects — without
+/// it, a stale exit sits around until a gateway connection eats the router
+/// timeout and falls open to a direct (blocked) connection.
+pub async fn maintain(shared: Arc<Shared>, m: &mut Maint) {
+    if !shared.active.load(Ordering::SeqCst) {
+        return;
+    }
+    if let Some(cur) = shared.get_exit() {
+        if probe_exit(&cur.addr).await {
+            m.fails = 0;
+            return; // still carries the gateway — keep it
+        }
+        m.fails += 1;
+        crate::log::log(&format!(
+            "pool: probe da saída {} falhou ({}/{})",
+            cur.addr, m.fails, GRACE
+        ));
+        if m.fails < GRACE {
+            return; // tolerate a transient blip
+        }
+        m.fails = 0;
+        if !shared.active.load(Ordering::SeqCst) {
+            return; // deactivated while probing — don't touch state
+        }
+        crate::log::log(&format!("pool: saída {} caiu -> procurando outra", cur.addr));
+        shared.clear_exit_if(&cur.addr);
+        shared.set_status("saída caiu — procurando outra…");
+    }
+    discover(shared, m).await;
+}
+
+/// Find and publish a fresh exit: race local Tor against the (cached) free list.
+async fn discover(shared: Arc<Shared>, m: &mut Maint) {
+    if !shared.active.load(Ordering::SeqCst) {
+        return;
+    }
+    m.fails = 0; // the exit we're about to publish gets a fresh grace budget
+    crate::log::log("pool: procurando saída");
     shared.set_status("procurando saída fora do Brasil (Tor + proxies)…");
 
-    // Race Tor detection and free-proxy validation concurrently; the first valid
-    // exit wins and is published immediately (the router's hold picks it up).
+    // Refresh the candidate list from the providers at most every FETCH_TTL
+    // (fetched_at=None counts as stale, so the first pass always fetches). Gate on
+    // staleness ALONE — never on cand_addrs.is_empty() — so an EMPTY result
+    // (providers rate-limited/down) does not force an immediate refetch next
+    // cycle, which would feed the very rate-limit loop this cache exists to avoid.
+    // An empty list simply means no exit this pass; we back off for FETCH_TTL.
+    let stale = m.fetched_at.map_or(true, |t| t.elapsed() >= FETCH_TTL);
+    if stale {
+        let cands = fetch_candidates().await;
+        crate::log::log(&format!("pool: {} candidatos (cache atualizado)", cands.len()));
+        m.cand_addrs = cands.into_iter().map(|c| c.addr).collect();
+        m.fetched_at = Some(Instant::now());
+    }
+    let addrs = m.cand_addrs.clone();
+
+    // Race Tor detection and free-proxy validation; the first valid exit wins and
+    // is published immediately (the router picks it up).
     let tor_task = {
         let sh = shared.clone();
         tokio::spawn(async move {
             match try_tor().await {
                 Some(tor) => publish_if_first(&sh, tor, "Tor"),
-                None => crate::log::log("pool: no local Tor reachable"),
+                None => crate::log::log("pool: nenhum Tor local acessível"),
             }
         })
     };
     let free_task = {
         let sh = shared.clone();
-        tokio::spawn(async move { free_search(sh).await })
+        tokio::spawn(async move { free_search(sh, addrs).await })
     };
     let _ = tokio::join!(tor_task, free_task);
 
-    if shared.get_exit().is_none() {
-        crate::log::log("pool: NO exit found -> gateway goes DIRECT (Go Live stays blocked)");
+    if shared.active.load(Ordering::SeqCst) && shared.get_exit().is_none() {
+        crate::log::log("pool: nenhuma saída -> gateway vai DIRETO (Go Live bloqueado)");
         shared.set_status("sem saída fora do Brasil — abra o Tor Browser para estabilidade");
     }
+}
+
+/// Keep-warm liveness probe for the one held exit. Runs the SAME full-TLS
+/// validation as discovery — so it catches an exit that still accepts a tunnel
+/// but mangles/RSTs the payload (a bare CONNECT check would pass such a half-dead
+/// exit forever) — just with a generous timeout so a slow-but-working exit is not
+/// churned every cycle.
+async fn probe_exit(addr: &str) -> bool {
+    validate(addr, PROBE_TIMEOUT).await.is_some()
 }
 
 /// Publish an exit if we don't have one yet, or upgrade to a US exit.
 fn publish_if_first(shared: &Shared, e: ExitInfo, via: &str) {
     let mut guard = shared.exit.lock().unwrap();
+    // Re-check active WHILE holding the exit lock. deactivate() flips active=false
+    // and then clears the exit under this same lock, so checking here serializes
+    // the two: a validate task finishing after stop either sees inactive and skips,
+    // or writes and deactivate's subsequent set_exit(None) removes it — never a
+    // live exit left behind for a stopped app.
+    if !shared.active.load(Ordering::SeqCst) {
+        return;
+    }
     let take = match &*guard {
         None => true,
         Some(cur) => e.country == "US" && cur.country != "US",
@@ -72,26 +169,25 @@ fn publish_if_first(shared: &Shared, e: ExitInfo, via: &str) {
     }
 }
 
-/// Fetch + validate free proxies in batches, publishing each success as it lands.
-async fn free_search(shared: Arc<Shared>) {
-    let cands = fetch_candidates().await;
-    crate::log::log(&format!("pool: fetched {} free candidates", cands.len()));
-    if cands.is_empty() {
+/// Validate the (already-ranked, cached) candidate addrs in batches, publishing
+/// each success as it lands.
+async fn free_search(shared: Arc<Shared>, addrs: Vec<String>) {
+    if addrs.is_empty() {
         return;
     }
-    for batch in cands.chunks(BATCH) {
-        // Stop once we already have the ideal (US) exit.
-        if let Some(e) = shared.get_exit() {
-            if e.country == "US" {
-                break;
-            }
+    for batch in addrs.chunks(BATCH) {
+        // Stop as soon as any working non-BR exit is published. Candidates are
+        // ranked US-first, so the first success is usually US anyway, and getting
+        // Discord routed fast beats holding out for a marginally-better country.
+        if shared.get_exit().is_some() {
+            break;
         }
         let mut handles = Vec::new();
-        for c in batch {
-            let addr = c.addr.clone();
+        for addr in batch {
+            let addr = addr.clone();
             let sh = shared.clone();
             handles.push(tokio::spawn(async move {
-                if let Some(info) = validate(&addr).await {
+                if let Some(info) = validate(&addr, VALIDATE_TIMEOUT).await {
                     publish_if_first(&sh, info, "free");
                 }
             }));
@@ -115,7 +211,7 @@ async fn try_tor() -> Option<ExitInfo> {
         if !reachable {
             continue;
         }
-        if let Some(mut info) = validate(&addr).await {
+        if let Some(mut info) = validate(&addr, VALIDATE_TIMEOUT).await {
             info.country = if info.country.is_empty() {
                 "Tor".into()
             } else {
@@ -127,12 +223,14 @@ async fn try_tor() -> Option<ExitInfo> {
     None
 }
 
-/// Validate one SOCKS5 proxy by doing a TLS request to Cloudflare's trace.
-async fn validate(addr: &str) -> Option<ExitInfo> {
+/// Validate one SOCKS5 proxy by doing a TLS request to Cloudflare's trace under
+/// `timeout`. Success proves the tunnel + a valid certificate (no MITM) and
+/// reveals the true exit IP/country.
+async fn validate(addr: &str, timeout: Duration) -> Option<ExitInfo> {
     let proxy = reqwest::Proxy::all(format!("socks5h://{addr}")).ok()?;
     let client = reqwest::Client::builder()
         .proxy(proxy)
-        .timeout(VALIDATE_TIMEOUT)
+        .timeout(timeout)
         .build()
         .ok()?;
     let resp = client

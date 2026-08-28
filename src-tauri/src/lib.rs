@@ -43,15 +43,19 @@ fn activate(shared: &Arc<Shared>) {
             proxy::run_router(sh, rx_router).await;
         });
     }
-    // Pool: validate now, then re-validate every 5 minutes until stopped.
+    // Pool: find an exit now, then health-check it every 30s (a dead free proxy
+    // is dropped and replaced before Discord next reconnects), or immediately
+    // when the router signals a dead exit via `refresh_now`. `Maint` carries the
+    // grace counter + cached candidate list across passes.
     {
         let sh = shared.clone();
         let mut rx_pool = rx.clone();
         tauri::async_runtime::spawn(async move {
+            let mut maint = pool::Maint::default();
             loop {
-                pool::refresh_pool(sh.clone()).await;
+                pool::maintain(sh.clone(), &mut maint).await;
                 tokio::select! {
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(120)) => {}
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {}
                     _ = sh.refresh_now.notified() => {}
                     changed = rx_pool.changed() => {
                         if changed.is_err() || *rx_pool.borrow() { break; }

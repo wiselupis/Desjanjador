@@ -19,12 +19,25 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tokio_socks::tcp::Socks5Stream;
 
-/// How long to try the chosen exit before failing open to a direct connection,
-/// so a slow/dead exit never leaves Discord stuck "connecting" / logged out.
+/// Per-attempt cap on dialing the exit's SOCKS tunnel, so a slow/dead exit never
+/// leaves Discord stuck "connecting" / logged out.
 const EXIT_TIMEOUT: Duration = Duration::from_secs(6);
-/// If no exit is ready yet, HOLD a gateway connection this long waiting for one
-/// (so it's born routed) before failing open to direct.
-const HOLD_DEADLINE: Duration = Duration::from_secs(12);
+/// If no exit is ready yet, HOLD a gateway connection at most this long waiting
+/// for one (so it's born routed) before failing open to direct.
+const HOLD_DEADLINE: Duration = Duration::from_secs(8);
+/// Soft overall budget for routing ONE gateway CONNECT (across both attempts +
+/// any hold) before failing open to a DIRECT connection. It bounds the WAITS; the
+/// final dial and the direct fallback each keep a MIN_DIAL floor (so a fresh exit
+/// / the fail-open still get a fair shot), so the true worst-case hold is
+/// ~GATEWAY_DEADLINE + 2*MIN_DIAL (~16s). That still keeps a stale-exit retry from
+/// holding Discord anywhere near indefinitely (the pre-fix path could exceed 20s).
+const GATEWAY_DEADLINE: Duration = Duration::from_secs(12);
+/// Cap the direct fallback connect too, so a blackholed route can't hang forever.
+const DIRECT_TIMEOUT: Duration = Duration::from_secs(8);
+/// Floor for any single connect attempt. Near the overall deadline a freshly
+/// found exit must still get a fair window (a live proxy connects well within
+/// this), so it's never starved to a sub-second timeout and then wrongly cleared.
+const MIN_DIAL: Duration = Duration::from_secs(2);
 
 pub fn pac_body(port: u16) -> String {
     format!(
@@ -114,51 +127,12 @@ async fn handle_connect(
     port: u16,
 ) -> std::io::Result<()> {
     let is_gateway = host == "gateway.discord.gg" || host.ends_with(".discord.gg");
-    // Always route the gateway through the exit (so Go Live survives reconnects).
-    // If no exit is ready yet, HOLD briefly so the connection is born routed.
-    let exit = if is_gateway {
-        match shared.get_exit() {
-            Some(e) => Some(e),
-            None => wait_for_exit(&shared, HOLD_DEADLINE).await,
-        }
+    let upstream: Option<Upstream> = if is_gateway {
+        gateway_upstream(&shared, &host, port).await
     } else {
-        None
-    };
-
-    // Try the exit; if it's slow or dead, FAIL OPEN to a direct connection (so
-    // Discord never gets stuck / logged out) and trigger a fresh pool validation.
-    let upstream: Option<Upstream> = match exit {
-        Some(e) => {
-            match tokio::time::timeout(
-                EXIT_TIMEOUT,
-                Socks5Stream::connect(e.addr.as_str(), (host.as_str(), port)),
-            )
+        connect_direct(&host, port, DIRECT_TIMEOUT)
             .await
-            {
-                Ok(Ok(s)) => {
-                    crate::log::log(&format!(
-                        "router: gateway {host} -> exit {} ({})",
-                        e.ip, e.country
-                    ));
-                    Some(Upstream::Socks(s))
-                }
-                _ => {
-                    crate::log::log(&format!(
-                        "router: exit {} lento/morto -> DIRECT + revalidar",
-                        e.addr
-                    ));
-                    shared.set_exit(None);
-                    shared.refresh_now.notify_one();
-                    connect_direct(&host, port).await.map(Upstream::Direct)
-                }
-            }
-        }
-        None => {
-            if is_gateway {
-                crate::log::log("router: gateway -> DIRECT (sem saida a tempo)");
-            }
-            connect_direct(&host, port).await.map(Upstream::Direct)
-        }
+            .map(Upstream::Direct)
     };
 
     match upstream {
@@ -184,8 +158,79 @@ async fn handle_connect(
     Ok(())
 }
 
-async fn connect_direct(host: &str, port: u16) -> Option<TcpStream> {
-    TcpStream::connect((host, port)).await.ok()
+/// Route a Discord gateway connection through a live non-BR exit.
+///
+/// Tries the current exit; if it's slow/dead, drops it, kicks a pool refresh, and
+/// waits briefly for a fresh exit to try instead. Only if no exit can carry the
+/// connection does it fail open to a DIRECT connection — so Discord always
+/// connects (even if Go Live stays blocked that session) and, crucially, a stale
+/// exit after a long idle no longer silently drops the tunnel: we swap in a fresh
+/// one on the reconnect itself.
+async fn gateway_upstream(shared: &Arc<Shared>, host: &str, port: u16) -> Option<Upstream> {
+    let overall = Instant::now() + GATEWAY_DEADLINE;
+    for attempt in 0..2u8 {
+        let left = overall.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        // Use the ready exit, or (if none) HOLD briefly for one so the connection
+        // is born routed rather than direct — bounded by the overall budget.
+        let exit = match shared.get_exit() {
+            Some(e) => Some(e),
+            None => wait_for_exit(shared, left.min(HOLD_DEADLINE)).await,
+        };
+        let e = match exit {
+            Some(e) => e,
+            None => break, // no exit available in time -> direct
+        };
+        // Give the dial a FAIR window even near the deadline (MIN_DIAL floor): a
+        // live proxy connects well within it, so a just-published exit is never
+        // starved to a sub-second timeout and then wrongly cleared below.
+        let left = overall.saturating_duration_since(Instant::now());
+        let dial = left.min(EXIT_TIMEOUT).max(MIN_DIAL);
+        match tokio::time::timeout(
+            dial,
+            Socks5Stream::connect(e.addr.as_str(), (host, port)),
+        )
+        .await
+        {
+            Ok(Ok(s)) => {
+                crate::log::log(&format!(
+                    "router: gateway {host} -> exit {} ({})",
+                    e.ip, e.country
+                ));
+                return Some(Upstream::Socks(s));
+            }
+            _ => {
+                crate::log::log(&format!(
+                    "router: exit {} lento/morto -> {}",
+                    e.addr,
+                    if attempt == 0 { "revalidar + tentar outra" } else { "DIRECT" }
+                ));
+                // Clear ONLY this exit (leave a fresh one the health loop may have
+                // just published), and kick a refresh to find a replacement.
+                shared.clear_exit_if(&e.addr);
+                shared.refresh_now.notify_one();
+                // Next iteration: wait_for_exit blocks (briefly) for the replacement.
+            }
+        }
+    }
+    // Fail open to DIRECT, bounded by whatever budget remains (floored to MIN_DIAL
+    // so a normal direct connect still completes), so the direct tail adds at most
+    // ~MIN_DIAL rather than a full DIRECT_TIMEOUT on top of the loop budget.
+    let direct_to = overall
+        .saturating_duration_since(Instant::now())
+        .min(DIRECT_TIMEOUT)
+        .max(MIN_DIAL);
+    crate::log::log("router: gateway -> DIRECT (sem saída viável)");
+    connect_direct(host, port, direct_to).await.map(Upstream::Direct)
+}
+
+async fn connect_direct(host: &str, port: u16, timeout: Duration) -> Option<TcpStream> {
+    match tokio::time::timeout(timeout, TcpStream::connect((host, port))).await {
+        Ok(Ok(s)) => Some(s),
+        _ => None,
+    }
 }
 
 /// Poll for a ready exit up to `deadline` so the gateway is born routed.

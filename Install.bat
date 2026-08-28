@@ -21,10 +21,19 @@ if not defined WV (
     if exist "%TEMP%\wv2.exe" start /wait "" "%TEMP%\wv2.exe" /silent /install
 )
 
-echo ==^> Baixando o Desjanjador (ultima versao)...
-powershell -NoProfile -Command "[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; Invoke-WebRequest '%EXEURL%' -OutFile '%EXE%'; try{Unblock-File '%EXE%'}catch{}"
+echo ==^> Verificando a versao...
+rem  Paths go through the environment (not interpolated into quotes), so an
+rem  apostrophe in the profile path (e.g. C:\Users\O'Brien\...) can't break the
+rem  PowerShell command. We download to a temp file, validate it (size + version
+rem  resource), then atomically move it into place, so a partial/failed download
+rem  never clobbers a working install and a corrupt exe is never launched.
+set "DJ_REPO=%REPO%"
+set "DJ_EXE=%EXE%"
+set "DJ_URL=%EXEURL%"
+set "DJ_TMP=%APPDIR%\desjanjador.new.exe"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; $repo=$env:DJ_REPO; $exe=$env:DJ_EXE; $url=$env:DJ_URL; $tmp=$env:DJ_TMP; try{$latest=((Invoke-RestMethod -UseBasicParsing -Headers @{'User-Agent'='desjanjador'} \"https://api.github.com/repos/$repo/releases/latest\").tag_name) -replace '^v',''}catch{$latest=''}; $have=''; if(Test-Path -LiteralPath $exe){try{$have=(Get-Item -LiteralPath $exe).VersionInfo.FileVersion}catch{}}; if($have -and (($have -eq $latest) -or (-not $latest))){ if($latest){Write-Host ('    ja atualizado (v'+$have+') - abrindo')}else{Write-Host ('    sem conexao ao GitHub; abrindo o instalado (v'+$have+')')}; exit 10 }; Write-Host ('    baixando '+$(if($latest){'v'+$latest}else{'ultima versao'})+'...'); try{Invoke-WebRequest -UseBasicParsing $url -OutFile $tmp -ErrorAction Stop}catch{Write-Host '    falha no download'; exit 2}; $ok=$false; try{$fi=Get-Item -LiteralPath $tmp; if($fi.Length -gt 1000000 -and $fi.VersionInfo.FileVersion){$ok=$true}}catch{}; if(-not $ok){Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue; Write-Host '    download invalido'; exit 3}; try{Unblock-File -LiteralPath $tmp}catch{}; try{Move-Item -LiteralPath $tmp -Destination $exe -Force -ErrorAction Stop; exit 0}catch{Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue; Write-Host '    nao foi possivel substituir (feche o app e tente de novo)'; exit 4}"
 if not exist "%EXE%" (
-    echo Falha no download. Verifique a internet e tente de novo.
+    echo Falha ao instalar o Desjanjador. Verifique a internet e tente de novo.
     pause
     exit /b 1
 )

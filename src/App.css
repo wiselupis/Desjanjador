@@ -35,10 +35,21 @@ body {
   padding: 18px 20px 16px;
   display: flex;
   flex-direction: column;
-  gap: 14px;
-  height: 100vh;
+  height: 100%;
   overflow: hidden;
   position: relative;
+}
+
+/* The scrolling middle. flex:1 + min-height:0 lets it absorb any window/DPI
+   size change and clip its own overflow, so the footer (Sair) stays pinned to
+   the bottom instead of jumping when the viewport is shorter than the design. */
+.content {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  overflow: hidden;
 }
 
 .mascot {
@@ -256,7 +267,8 @@ body {
 }
 
 .exit-btn {
-  margin-top: auto;
+  margin-top: 14px;
+  flex: none;
   background: var(--danger);
   color: var(--danger-fg);
   border: 1px solid #4a2a2a;
@@ -272,7 +284,8 @@ body {
 }
 
 .foot {
-  margin: 0;
+  margin: 8px 0 0;
+  flex: none;
   text-align: center;
   color: var(--muted);
   font-size: 10.5px;
