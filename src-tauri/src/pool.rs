@@ -45,13 +45,27 @@ struct Cand {
     timeout: f64,
 }
 
-/// Loop-owned state for the keep-warm maintainer (health grace counter + cached
-/// provider candidate list, so we don't re-fetch the providers every cycle).
+/// Loop-owned state for the keep-warm maintainer: health grace counter, the
+/// cached provider candidate list (so we don't re-fetch every cycle), and the
+/// last-working exit addr to re-try once on warm start.
 #[derive(Default)]
 pub struct Maint {
     fails: u8,
     cand_addrs: Vec<String>,
     fetched_at: Option<Instant>,
+    /// Last working exit addr from a previous run; raced on the first discovery
+    /// then cleared (`take`n) so it's only re-tried once.
+    cached: Option<String>,
+}
+
+impl Maint {
+    /// Seed with the last-working exit addr (from settings) for a warm start.
+    pub fn new(cached: Option<String>) -> Self {
+        Maint {
+            cached,
+            ..Default::default()
+        }
+    }
 }
 
 /// One maintenance pass, run on a ~30s cadence and whenever the router signals a
@@ -97,7 +111,7 @@ async fn discover(shared: Arc<Shared>, m: &mut Maint) {
     }
     m.fails = 0; // the exit we're about to publish gets a fresh grace budget
     crate::log::log("pool: procurando saída");
-    shared.set_status("procurando saída fora do Brasil (Tor + proxies)…");
+    shared.set_status("procurando uma saída rápida fora do Brasil…");
 
     // Refresh the candidate list from the providers at most every FETCH_TTL
     // (fetched_at=None counts as stale, so the first pass always fetches). Gate on
@@ -114,8 +128,18 @@ async fn discover(shared: Arc<Shared>, m: &mut Maint) {
     }
     let addrs = m.cand_addrs.clone();
 
-    // Race Tor detection and free-proxy validation; the first valid exit wins and
-    // is published immediately (the router picks it up).
+    // Race, all concurrently — the first valid exit wins and is published
+    // immediately (the router picks it up); publish_if_first keeps whichever lands
+    // first: (1) the cached last-working exit — usually the fastest, an instant
+    // reconnect; (2) local Tor if present; (3) the free-proxy list.
+    let cached_task = m.cached.take().map(|addr| {
+        let sh = shared.clone();
+        tokio::spawn(async move {
+            if let Some(info) = validate(&addr, VALIDATE_TIMEOUT).await {
+                publish_if_first(&sh, info, "cache");
+            }
+        })
+    });
     let tor_task = {
         let sh = shared.clone();
         tokio::spawn(async move {
@@ -130,10 +154,17 @@ async fn discover(shared: Arc<Shared>, m: &mut Maint) {
         tokio::spawn(async move { free_search(sh, addrs).await })
     };
     let _ = tokio::join!(tor_task, free_task);
+    if let Some(t) = cached_task {
+        let _ = t.await;
+    }
 
-    if shared.active.load(Ordering::SeqCst) && shared.get_exit().is_none() {
+    // Remember the working exit so the next launch re-tries it instantly.
+    if let Some(e) = shared.get_exit() {
+        let dir = shared.config_dir.lock().unwrap().clone();
+        crate::settings::save_last_exit(&dir, Some(e));
+    } else if shared.active.load(Ordering::SeqCst) {
         crate::log::log("pool: nenhuma saída -> gateway vai DIRETO (Go Live bloqueado)");
-        shared.set_status("sem saída fora do Brasil — abra o Tor Browser para estabilidade");
+        shared.set_status("sem saída no momento — tentando novamente…");
     }
 }
 
@@ -169,33 +200,42 @@ fn publish_if_first(shared: &Shared, e: ExitInfo, via: &str) {
     }
 }
 
-/// Validate the (already-ranked, cached) candidate addrs in batches, publishing
-/// each success as it lands.
+/// Validate the (already-ranked, cached) candidate addrs, keeping up to BATCH
+/// checks in flight and STOPPING at the first success (aborting the rest) rather
+/// than waiting for every straggler — so a working exit lands as fast as any one
+/// proxy responds, not as slow as the slowest in a batch. Candidates are ranked
+/// US-first, so the first success is usually US anyway.
 async fn free_search(shared: Arc<Shared>, addrs: Vec<String>) {
+    use tokio::task::JoinSet;
     if addrs.is_empty() {
         return;
     }
-    for batch in addrs.chunks(BATCH) {
-        // Stop as soon as any working non-BR exit is published. Candidates are
-        // ranked US-first, so the first success is usually US anyway, and getting
-        // Discord routed fast beats holding out for a marginally-better country.
-        if shared.get_exit().is_some() {
-            break;
-        }
-        let mut handles = Vec::new();
-        for addr in batch {
-            let addr = addr.clone();
-            let sh = shared.clone();
-            handles.push(tokio::spawn(async move {
-                if let Some(info) = validate(&addr, VALIDATE_TIMEOUT).await {
-                    publish_if_first(&sh, info, "free");
-                }
-            }));
-        }
-        for h in handles {
-            let _ = h.await;
+    let mut iter = addrs.into_iter();
+    let mut set: JoinSet<()> = JoinSet::new();
+    for _ in 0..BATCH {
+        match iter.next() {
+            Some(addr) => spawn_validate(&mut set, &shared, addr),
+            None => break,
         }
     }
+    while set.join_next().await.is_some() {
+        if shared.get_exit().is_some() {
+            set.abort_all();
+            break; // someone published — stop racing
+        }
+        if let Some(addr) = iter.next() {
+            spawn_validate(&mut set, &shared, addr); // keep the pipeline full
+        }
+    }
+}
+
+fn spawn_validate(set: &mut tokio::task::JoinSet<()>, shared: &Arc<Shared>, addr: String) {
+    let sh = shared.clone();
+    set.spawn(async move {
+        if let Some(info) = validate(&addr, VALIDATE_TIMEOUT).await {
+            publish_if_first(&sh, info, "free");
+        }
+    });
 }
 
 /// If a local Tor SOCKS port is up (Tor Browser 9150 or daemon 9050) and its
@@ -261,8 +301,9 @@ async fn validate(addr: &str, timeout: Duration) -> Option<ExitInfo> {
     })
 }
 
-/// Fetch candidates from ProxyScrape, falling back to Geonode. Returns a ranked
-/// list (alive + US + high uptime + low timeout first), 4145 dropped.
+/// Fetch candidates from ProxyScrape + Geonode (in parallel, merged). Returns a
+/// list ranked by reliability (alive + low latency + high uptime first), 4145
+/// dropped, capped at 120.
 async fn fetch_candidates() -> Vec<Cand> {
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
@@ -289,16 +330,20 @@ async fn fetch_candidates() -> Vec<Cand> {
     // Drop 4145 (SOCKS4 TLS-interception hotspot) and dead entries with no data.
     cands.retain(|c| !c.addr.ends_with(":4145"));
 
+    // Rank by RELIABILITY first (alive, then low latency, then high uptime) so we
+    // hit a working proxy fast regardless of country; the privacy-friendly country
+    // order is only a tiebreaker among equally-good ones. Any non-BR exit is
+    // accepted (see validate), so this only decides who we try first.
     cands.sort_by(|a, b| {
         let ap = PREFERRED.iter().position(|c| *c == a.country).unwrap_or(99);
         let bp = PREFERRED.iter().position(|c| *c == b.country).unwrap_or(99);
         b.alive
             .cmp(&a.alive)
-            .then(ap.cmp(&bp))
-            .then(b.uptime.partial_cmp(&a.uptime).unwrap_or(std::cmp::Ordering::Equal))
             .then(a.timeout.partial_cmp(&b.timeout).unwrap_or(std::cmp::Ordering::Equal))
+            .then(b.uptime.partial_cmp(&a.uptime).unwrap_or(std::cmp::Ordering::Equal))
+            .then(ap.cmp(&bp))
     });
-    cands.truncate(72);
+    cands.truncate(120);
     cands
 }
 

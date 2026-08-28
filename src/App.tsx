@@ -208,7 +208,10 @@ export default function App() {
           <li>Reinicie o Discord (Stable / PTB / Canary).</li>
           <li>Entre numa call de voz e teste o Go&nbsp;Live / câmera.</li>
         </ol>
-        <span className="tip">Dica: abra o Tor&nbsp;Browser para uma saída estável.</span>
+        <span className="tip">
+          A saída é escolhida automaticamente entre proxies rápidos e confiáveis. O
+          Tor&nbsp;Browser, se estiver aberto, também serve como alternativa.
+        </span>
       </section>
 
       <section className="card patch">

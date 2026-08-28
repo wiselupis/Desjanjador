@@ -26,8 +26,12 @@ pub fn enable() -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     // "--tray" makes an autostarted instance stay in the tray (no window popup).
     let tr = format!("\"{}\" --tray", exe.display());
+    // /DELAY 20s: an ONLOGON task fires before the shell tray + WebView2 runtime
+    // are ready at cold boot, which left the app half-started (tray icon shows but
+    // the window won't open). A short delay lets the desktop settle first.
     let out = schtasks(&[
-        "/Create", "/TN", TASK, "/TR", &tr, "/SC", "ONLOGON", "/RL", "HIGHEST", "/F",
+        "/Create", "/TN", TASK, "/TR", &tr, "/SC", "ONLOGON", "/DELAY", "0000:20",
+        "/RL", "HIGHEST", "/F",
     ])
     .map_err(|e| e.to_string())?;
     if out.status.success() {

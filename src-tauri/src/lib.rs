@@ -51,7 +51,13 @@ fn activate(shared: &Arc<Shared>) {
         let sh = shared.clone();
         let mut rx_pool = rx.clone();
         tauri::async_runtime::spawn(async move {
-            let mut maint = pool::Maint::default();
+            // Warm start: seed the maintainer with the last working exit so the
+            // first discovery re-tries it concurrently (usually an instant reconnect).
+            let cached = {
+                let dir = sh.config_dir.lock().unwrap().clone();
+                settings::load(&dir).last_exit.map(|e| e.addr)
+            };
+            let mut maint = pool::Maint::new(cached);
             loop {
                 pool::maintain(sh.clone(), &mut maint).await;
                 tokio::select! {
@@ -85,6 +91,18 @@ fn cleanup(shared: &Arc<Shared>) {
     let _ = sysproxy::disable();
 }
 
+/// Bring the main window to the foreground reliably (tray Open / click) — works
+/// whether it's hidden or minimized. Logs if the window is somehow gone.
+fn show_main(app: &AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.unminimize();
+        let _ = w.show();
+        let _ = w.set_focus();
+    } else {
+        log::log("tray: janela principal ausente");
+    }
+}
+
 fn status_dto(_app: &AppHandle, shared: &Shared) -> StatusDto {
     StatusDto {
         active: shared.active.load(Ordering::SeqCst),
@@ -110,7 +128,7 @@ fn set_active(app: AppHandle, shared: State<Arc<Shared>>, on: bool) -> StatusDto
         deactivate(&shared);
     }
     let dir = shared.config_dir.lock().unwrap().clone();
-    settings::save(&dir, &settings::Settings { active: on });
+    settings::save_active(&dir, on);
     status_dto(&app, &shared)
 }
 
@@ -245,9 +263,14 @@ pub fn run() {
                 log::init(&dir);
                 *shared_setup.config_dir.lock().unwrap() = dir;
             }
-            shared_setup
-                .autostart
-                .store(autostart::is_enabled(), Ordering::SeqCst);
+            let autostart_on = autostart::is_enabled();
+            shared_setup.autostart.store(autostart_on, Ordering::SeqCst);
+            // Migrate an existing autostart task to the current exe path + logon
+            // delay (older versions created it with no delay -> half-started tray
+            // at cold boot). Idempotent; only when already enabled.
+            if autostart_on {
+                let _ = autostart::enable();
+            }
 
             // Tray icon with an Open / Exit menu.
             let open_i = MenuItem::with_id(&handle, "open", "Open", true, None::<&str>)?;
@@ -261,12 +284,7 @@ pub fn run() {
                 .menu(&menu)
                 .show_menu_on_left_click(false)
                 .on_menu_event(move |app, event| match event.id.as_ref() {
-                    "open" => {
-                        if let Some(w) = app.get_webview_window("main") {
-                            let _ = w.show();
-                            let _ = w.set_focus();
-                        }
-                    }
+                    "open" => show_main(app),
                     "exit" => {
                         cleanup(&sh_menu);
                         app.exit(0);
@@ -280,11 +298,7 @@ pub fn run() {
                         ..
                     } = event
                     {
-                        let app = tray.app_handle();
-                        if let Some(w) = app.get_webview_window("main") {
-                            let _ = w.show();
-                            let _ = w.set_focus();
-                        }
+                        show_main(tray.app_handle());
                     }
                 })
                 .build(&handle)?;
@@ -292,7 +306,8 @@ pub fn run() {
             // Restore previous Active state on launch; otherwise clear any stale
             // system PAC a prior crash may have left pointing at us.
             let dir = shared_setup.config_dir.lock().unwrap().clone();
-            if settings::load(&dir).active {
+            let was_active = settings::load(&dir).active;
+            if was_active {
                 activate(&shared_setup);
             } else {
                 sysproxy::disable_if_ours(shared_setup.port);
@@ -312,15 +327,28 @@ pub fn run() {
                 log::log(&format!("window: tray-start={} visible={:?}", tray, w.is_visible()));
             }
 
-            // Autostart (tray) launch: quietly notify about updates instead of
-            // popping the in-window dialog. The dialog still appears if the user
-            // opens the window.
+            // Autostart (tray) launch.
             if std::env::args().any(|a| a == "--tray") {
+                use tauri_plugin_notification::NotificationExt;
+                // The app starts ~20s after logon (task delay, for a reliable
+                // tray), so if it auto-activated, Discord may already have opened
+                // its gateway on the direct BR route — and an already-open socket
+                // is never re-proxied. Nudge the user to restart Discord so its
+                // gateway re-connects through the exit.
+                if was_active {
+                    let _ = handle
+                        .notification()
+                        .builder()
+                        .title("Desjanjador ativo")
+                        .body("Se o Discord já estiver aberto, reinicie-o para liberar o Go Live e a câmera.")
+                        .show();
+                }
+                // Quietly notify about updates instead of popping the in-window
+                // dialog (which still appears if the user opens the window).
                 let h = handle.clone();
                 tauri::async_runtime::spawn(async move {
                     if let Ok(info) = updater::check().await {
                         if info.available {
-                            use tauri_plugin_notification::NotificationExt;
                             let _ = h
                                 .notification()
                                 .builder()

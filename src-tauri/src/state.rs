@@ -1,11 +1,11 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Mutex;
 use tokio::sync::{watch, Notify};
 
 /// A validated non-BR exit the router can dial through.
-#[derive(Clone, Serialize, Default, Debug)]
+#[derive(Clone, Serialize, Deserialize, Default, Debug)]
 pub struct ExitInfo {
     pub addr: String,
     pub ip: String,
