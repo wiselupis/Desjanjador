@@ -142,9 +142,13 @@ async fn handle_connect(
     let is_gateway = host == "discord.gg" || host.ends_with(".discord.gg");
     let is_api =
         host == "discord.com" || host == "ptb.discord.com" || host == "canary.discord.com";
-    let route = is_gateway || (is_api && shared.proxy_api.load(Ordering::SeqCst));
-    let upstream: Option<Upstream> = if route {
+    let upstream: Option<Upstream> = if is_gateway {
+        // The gateway keeps its own STABLE primary (persistent WSS — never churn it).
         gateway_upstream(&shared, &host, port).await
+    } else if is_api && shared.proxy_api.load(Ordering::SeqCst) {
+        // The REST API rides the FASTEST pooled exit, so unblocking restricted channels
+        // slows the app as little as possible (voice-join API calls included).
+        api_upstream(&shared, &host, port).await
     } else {
         connect_direct(&host, port, DIRECT_TIMEOUT)
             .await
@@ -259,6 +263,57 @@ async fn gateway_upstream(shared: &Arc<Shared>, host: &str, port: u16) -> Option
         .min(DIRECT_TIMEOUT)
         .max(MIN_DIAL);
     crate::log::log("router: gateway -> DIRECT (sem saída viável)");
+    connect_direct(host, port, direct_to).await.map(Upstream::Direct)
+}
+
+/// Route a Discord REST API connection (the restricted-channel unblock) through a
+/// pooled exit, FASTEST-first, so it adds as little delay as possible; the gateway
+/// keeps its own stable primary. Both exits are allowlisted, so the age-gate (read on
+/// the API IP) and the region gate (read on the gateway IP) both still pass.
+///
+/// Because a CONNECT tunnel is one long-lived HTTP/2 connection, its routing is fixed
+/// for the whole connection lifetime — so failing open to DIRECT would silently drop
+/// the bypass for MANY requests, not one. We therefore try EVERY pooled exit (fastest
+/// first) before giving up, and kick a pool refresh so a dead exit is pruned; only if
+/// they ALL fail do we fall to DIRECT (degraded: bypass off until Discord reopens the
+/// connection) so the client still never hangs.
+async fn api_upstream(shared: &Arc<Shared>, host: &str, port: u16) -> Option<Upstream> {
+    let overall = Instant::now() + GATEWAY_DEADLINE;
+    let target = (host, port);
+    let mut tried = false;
+    for e in shared.exits_by_latency() {
+        let left = overall.saturating_duration_since(Instant::now());
+        if left <= MIN_DIAL {
+            break; // reserve budget for the direct fallback
+        }
+        tried = true;
+        let dial = left.min(EXIT_TIMEOUT).max(MIN_DIAL);
+        let connect = async {
+            if e.addr.starts_with("127.0.0.1:") {
+                Socks5Stream::connect_with_password(e.addr.as_str(), target, TOR_USER, TOR_PASS)
+                    .await
+            } else {
+                Socks5Stream::connect(e.addr.as_str(), target).await
+            }
+        };
+        if let Ok(Ok(s)) = tokio::time::timeout(dial, connect).await {
+            crate::log::log(&format!(
+                "router: api {host} -> exit {} ({}, {}ms)",
+                e.ip, e.country, e.latency_ms
+            ));
+            return Some(Upstream::Socks(s));
+        }
+    }
+    if tried {
+        // Some pooled exit failed — ask the health loop to prune/replace it now instead
+        // of waiting for the next ~20s cycle.
+        shared.refresh_now.notify_one();
+    }
+    let direct_to = overall
+        .saturating_duration_since(Instant::now())
+        .min(DIRECT_TIMEOUT)
+        .max(MIN_DIAL);
+    crate::log::log(&format!("router: api {host} -> DIRETO (sem saída)"));
     connect_direct(host, port, direct_to).await.map(Upstream::Direct)
 }
 

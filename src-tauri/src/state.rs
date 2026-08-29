@@ -99,6 +99,21 @@ impl Shared {
         self.exit.lock().unwrap().clone()
     }
 
+    /// All available exits (primary + warm pool), deduped by addr and sorted
+    /// FASTEST-first by measured latency. The API router tries them in order so a
+    /// single dead exit never drops the whole connection to direct — it only fails
+    /// open if EVERY pooled exit fails.
+    pub fn exits_by_latency(&self) -> Vec<ExitInfo> {
+        // Clone the primary (releasing the exit lock) before taking the backups lock,
+        // preserving the exit-before-backups order used everywhere.
+        let mut v: Vec<ExitInfo> = self.exit.lock().unwrap().clone().into_iter().collect();
+        v.extend(self.backups.lock().unwrap().iter().cloned());
+        let mut seen = std::collections::HashSet::new();
+        v.retain(|e| seen.insert(e.addr.clone()));
+        v.sort_by_key(|e| e.latency_ms);
+        v
+    }
+
     /// Clear the exit ONLY if it is still the one at `addr`. Prevents a slow
     /// router connection from clobbering an exit the health loop already swapped
     /// in for a fresh one.
