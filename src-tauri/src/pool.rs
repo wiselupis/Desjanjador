@@ -631,6 +631,12 @@ async fn gw_connect(addr: &str, timeout: Duration) -> Option<u32> {
 async fn fetch_candidates() -> Vec<Cand> {
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
+        // Force IPv4: on a machine with IPv6 enabled but NO working IPv6 route (e.g. the
+        // router has IPv6 off), the client would try the sources' AAAA address, black-hole,
+        // and time out -> sources=0, even though the same URL opens in a browser (browsers
+        // fall back via Happy Eyeballs). Every source + Discord's gateway is on IPv4, so
+        // binding to IPv4 removes this failure mode with no downside.
+        .local_address(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
         // A real browser UA: some networks' WAF/IDS reject the default reqwest UA, which
         // can make the source fetch fail (sources=0) on a machine where the same URL
         // opens fine in a browser.
