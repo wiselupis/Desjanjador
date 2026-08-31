@@ -421,7 +421,19 @@ async fn discover(shared: Arc<Shared>, m: &mut Maint, avoid: &[String]) {
         ));
     } else if shared.active.load(Ordering::SeqCst) {
         crate::log::log("pool: nenhuma saída -> gateway vai DIRETO (Go Live bloqueado)");
-        shared.set_status("sem saída no momento — tentando novamente…");
+        // Diagnostic status: distinguish "the proxy lists themselves didn't load"
+        // (network/DNS/firewall blocking the sources — the exact case where a machine
+        // never finds any exit) from "lists loaded but no proxy connected".
+        if m.cand_addrs.is_empty() {
+            shared.set_status(
+                "sem saída — nenhuma lista de proxy carregou (rede/DNS bloqueando? tente DNS 1.1.1.1)",
+            );
+        } else {
+            shared.set_status(format!(
+                "sem saída — {} proxies testados, nenhum conectou (tentando novamente…)",
+                m.cand_addrs.len()
+            ));
+        }
     }
 }
 
