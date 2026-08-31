@@ -15,6 +15,7 @@ interface Status {
   proxy_api: boolean;
   use_tor: boolean;
   custom_proxy: string;
+  firewall_blocked: boolean;
   status: string;
   exit: ExitInfo | null;
   port: number;
@@ -75,6 +76,8 @@ export default function App() {
   const [refreshing, setRefreshing] = useState(false);
   const [editOpen, setEditOpen] = useState(false);
   const [customVal, setCustomVal] = useState("");
+  const [fwDismissed, setFwDismissed] = useState(false);
+  const [fwApplying, setFwApplying] = useState(false);
 
   const refresh = useCallback(async () => {
     try {
@@ -142,6 +145,23 @@ export default function App() {
       console.error(e);
     } finally {
       setTimeout(() => setRefreshing(false), 900);
+    }
+  };
+
+  // Re-arm the firewall popup for each fresh detection (once it's resolved, allow it to
+  // show again if the block reappears).
+  useEffect(() => {
+    if (!s?.firewall_blocked) setFwDismissed(false);
+  }, [s?.firewall_blocked]);
+
+  const applyFirewall = async () => {
+    setFwApplying(true);
+    try {
+      setS(await invoke<Status>("apply_firewall_fix"));
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setFwApplying(false);
     }
   };
 
@@ -327,6 +347,35 @@ export default function App() {
       <p className="foot">
         Fechar a janela mantém na bandeja. Reinicie o Discord após ativar.
       </p>
+
+      {s?.firewall_blocked && !fwDismissed && (
+        <div className="modal-overlay">
+          <div className="modal">
+            <h2>Firewall bloqueando</h2>
+            <p className="modal-notes">
+              Um firewall ou antivírus está bloqueando as conexões do Desjanjador
+              (erro 10013) — por isso nenhuma saída é encontrada. Deseja adicionar uma
+              exceção no Firewall do Windows?
+            </p>
+            <p className="modal-notes" style={{ opacity: 0.75 }}>
+              Se não resolver, o bloqueio é do seu antivírus/VPN — libere o
+              desjanjador.exe nele.
+            </p>
+            <div className="modal-btns">
+              <button
+                className="mini ghost"
+                disabled={fwApplying}
+                onClick={() => setFwDismissed(true)}
+              >
+                Agora não
+              </button>
+              <button className="mini primary" disabled={fwApplying} onClick={applyFirewall}>
+                {fwApplying ? "Aplicando…" : "Adicionar exceção"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {editOpen && (
         <div className="modal-overlay">

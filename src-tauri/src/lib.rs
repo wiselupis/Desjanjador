@@ -1,6 +1,7 @@
 mod autostart;
 mod clients;
 mod elevate;
+mod firewall;
 mod log;
 mod pool;
 mod proxy;
@@ -126,6 +127,7 @@ fn status_dto(_app: &AppHandle, shared: &Shared) -> StatusDto {
         proxy_api: shared.proxy_api.load(Ordering::SeqCst),
         use_tor: shared.use_tor.load(Ordering::SeqCst),
         custom_proxy: shared.get_custom().unwrap_or_default(),
+        firewall_blocked: pool::firewall_blocked(),
         status: shared.status.lock().unwrap().clone(),
         exit: shared.get_exit(),
         port: shared.port,
@@ -207,6 +209,20 @@ fn set_custom_proxy(app: AppHandle, shared: State<Arc<Shared>>, value: String) -
         // prefer the custom proxy, or fall back), and wake it now.
         shared.set_exit(None);
         shared.set_status("aplicando saída…");
+        shared.refresh_now.notify_one();
+    }
+    status_dto(&app, &shared)
+}
+
+/// User accepted the firewall popup: add a Windows Firewall exception for our exe (the
+/// app is already elevated, so netsh succeeds), clear the blocked flag, and retry the
+/// pool immediately.
+#[tauri::command]
+fn apply_firewall_fix(app: AppHandle, shared: State<Arc<Shared>>) -> StatusDto {
+    firewall::ensure_allowed();
+    pool::clear_firewall_blocked();
+    if shared.active.load(Ordering::SeqCst) {
+        shared.set_status("exceção aplicada — tentando novamente…");
         shared.refresh_now.notify_one();
     }
     status_dto(&app, &shared)
@@ -314,6 +330,7 @@ pub fn run() {
             set_proxy_api,
             set_use_tor,
             set_custom_proxy,
+            apply_firewall_fix,
             refresh_exit,
             set_autostart,
             exit_app,

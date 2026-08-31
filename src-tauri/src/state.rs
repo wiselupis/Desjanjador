@@ -34,6 +34,11 @@ pub struct ExitInfo {
     pub user: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pass: Option<String>,
+    /// True for a user-provided custom exit (with OR without creds). The custom-vs-pool
+    /// logic keys off THIS, not `user.is_some()` — a no-auth custom proxy has no creds
+    /// but must still be treated as pinned/exempt and never persisted to last_exits.
+    #[serde(default, skip)]
+    pub is_custom: bool,
 }
 
 /// Snapshot sent to the React UI.
@@ -49,6 +54,9 @@ pub struct StatusDto {
     /// The user's custom-proxy field (plaintext, for the edit modal to prefill).
     /// Empty = using the free pool.
     pub custom_proxy: String,
+    /// A connect failed with WSAEACCES (10013) — a firewall/security product is blocking
+    /// the app. The UI offers a one-click "add Windows Firewall exception".
+    pub firewall_blocked: bool,
 }
 
 /// Shared, thread-safe application state.

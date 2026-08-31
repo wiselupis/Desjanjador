@@ -13,6 +13,7 @@ set "APPDIR=%LOCALAPPDATA%\Desjanjador"
 echo ==^> Removendo o Desjanjador...
 taskkill /im desjanjador.exe /f >nul 2>&1
 schtasks /Delete /TN Desjanjador /F >nul 2>&1
+netsh advfirewall firewall delete rule name=Desjanjador >nul 2>&1
 reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v Desjanjador /f >nul 2>&1
 powershell -NoProfile -Command "$k='HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'; $c=(Get-ItemProperty $k -Name AutoConfigURL -ErrorAction SilentlyContinue).AutoConfigURL; if($c -like '*127.0.0.1:43110*'){Remove-ItemProperty $k -Name AutoConfigURL -ErrorAction SilentlyContinue}" >nul 2>&1
 rmdir /s /q "%APPDIR%" >nul 2>&1

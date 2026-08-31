@@ -15,7 +15,7 @@
 //! user gap). The pool self-heals for hours: dead backups are dropped and refilled.
 
 use crate::state::{ExitInfo, Shared, BACKUP_TARGET, TOR_PASS, TOR_USER};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
@@ -77,6 +77,16 @@ const BATCH: usize = 24;
 
 fn allowed(country: &str) -> bool {
     ALLOWED.contains(&country)
+}
+
+/// Set when an outbound connect fails with WSAEACCES (os error 10013) — a firewall /
+/// security product is blocking our exe. The UI reads this to offer a one-click fix.
+static FIREWALL_BLOCKED: AtomicBool = AtomicBool::new(false);
+pub fn firewall_blocked() -> bool {
+    FIREWALL_BLOCKED.load(Ordering::Relaxed)
+}
+pub fn clear_firewall_blocked() {
+    FIREWALL_BLOCKED.store(false, Ordering::Relaxed);
 }
 
 struct Cand {
@@ -168,12 +178,23 @@ pub async fn maintain(shared: Arc<Shared>, m: &mut Maint) {
             maintain_backups(&shared, m, &avoid).await; // keep the pool warm as fallback
             persist_top_exits(&shared, m);
             return;
-        } else if shared.get_exit().map_or(false, |e| e.user.is_some()) {
-            // The custom primary died and no other custom works → drop it so the pool
-            // takes over this cycle (we'll retry custom next cycle).
-            shared.set_exit(None);
-            shared.set_status("proxy fixo indisponível — usando o pool…");
-            crate::log::log("pool: proxy fixo indisponível — fallback para o pool");
+        } else if shared.get_exit().map_or(false, |e| e.is_custom) {
+            // The custom primary died and no other custom works → make-before-break to a
+            // warm pool backup (instant, no gap) if we have one, else clear + let the
+            // pool discover. Either way we keep re-checking custom every cycle and switch
+            // back up when one recovers.
+            match shared.take_fastest_backup() {
+                Some(b) => {
+                    shared.set_exit_if_active(b.clone());
+                    shared.set_status(format!("proxy fixo caiu — reserva {} · {}", b.country, b.ip));
+                    crate::log::log(&format!("pool: proxy fixo caiu -> reserva {} ({})", b.ip, b.country));
+                }
+                None => {
+                    shared.set_exit(None);
+                    shared.set_status("proxy fixo indisponível — usando o pool…");
+                    crate::log::log("pool: proxy fixo indisponível — fallback para o pool");
+                }
+            }
         }
     }
 
@@ -220,9 +241,9 @@ pub async fn maintain(shared: Arc<Shared>, m: &mut Maint) {
 fn persist_top_exits(shared: &Arc<Shared>, m: &mut Maint) {
     let mut all: Vec<ExitInfo> = shared.get_exit().into_iter().collect();
     all.extend(shared.get_backups());
-    // Never persist local Tor exits, nor the custom proxy (its creds live encrypted in
-    // settings.custom_proxy, not in plaintext last_exits).
-    all.retain(|e| !e.addr.starts_with("127.0.0.1:") && e.user.is_none());
+    // Never persist local Tor exits, nor the custom proxy (it's stored encrypted in
+    // settings.custom_proxy — keyed off is_custom so a no-auth custom is excluded too).
+    all.retain(|e| !e.addr.starts_with("127.0.0.1:") && !e.is_custom);
     all.sort_by_key(|e| e.latency_ms);
     all.truncate(2);
     if all.is_empty() {
@@ -424,14 +445,22 @@ async fn ensure_custom(shared: &Arc<Shared>, m: &mut Maint) {
             let changed = m.custom_raw.as_deref() != Some(r.as_str());
             let stale = is_url && m.custom_fetched_at.map_or(true, |t| t.elapsed() >= FETCH_TTL);
             if changed || stale {
-                m.custom_entries = resolve_custom_list(&r).await;
-                crate::log::log(&format!(
-                    "custom: {} proxies (fonte: {})",
-                    m.custom_entries.len(),
-                    if is_url { "URL" } else { "lista" }
-                ));
+                let resolved = resolve_custom_list(&r).await;
                 m.custom_raw = Some(r);
                 m.custom_fetched_at = Some(Instant::now());
+                // On a URL RE-fetch that transiently returns nothing, KEEP the previous
+                // list — don't drop the user to the free pool over one hiccup. A real
+                // change (new field value) always takes the fresh result.
+                if is_url && !changed && resolved.is_empty() && !m.custom_entries.is_empty() {
+                    crate::log::log("custom: URL vazia/falhou — mantendo a lista anterior");
+                } else {
+                    m.custom_entries = resolved;
+                    crate::log::log(&format!(
+                        "custom: {} proxies (fonte: {})",
+                        m.custom_entries.len(),
+                        if is_url { "URL" } else { "lista" }
+                    ));
+                }
             }
         }
     }
@@ -653,6 +682,7 @@ async fn validate(addr: &str, timeout: Duration) -> Option<ExitInfo> {
         latency_ms,
         user: None,
         pass: None,
+        is_custom: false,
     })
 }
 
@@ -678,6 +708,7 @@ async fn validate_custom(entry: &CustomEntry, timeout: Duration) -> Option<ExitI
         latency_ms,
         user: entry.user.clone(),
         pass: entry.pass.clone(),
+        is_custom: true,
     })
 }
 
@@ -745,8 +776,9 @@ struct CustomEntry {
     pass: Option<String>,
 }
 
-/// How many custom entries to validate concurrently per cycle (bounds a big URL list).
-const CUSTOM_SCAN: usize = 16;
+/// How many custom entries to validate concurrently per cycle (bounds a big URL list;
+/// covers any realistic hand-entered list and a decent slice of a URL pool).
+const CUSTOM_SCAN: usize = 64;
 
 /// Parse one proxy spec into a CustomEntry. Accepts (with an optional socks5:// prefix):
 ///   `host:port` | `host:port:user:pass` | `user:pass@host:port`
@@ -847,6 +879,11 @@ fn err_chain(e: &dyn std::error::Error) -> String {
     while let Some(s) = src {
         msg.push_str(&format!(" | {s}"));
         src = s.source();
+    }
+    // WSAEACCES: a firewall/security product is blocking our exe. Flag it so the UI can
+    // offer to add a Windows Firewall exception.
+    if msg.contains("10013") {
+        FIREWALL_BLOCKED.store(true, Ordering::Relaxed);
     }
     msg
 }

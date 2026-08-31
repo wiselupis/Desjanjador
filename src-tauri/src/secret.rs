@@ -50,12 +50,18 @@ fn to_hex(b: &[u8]) -> String {
 }
 
 fn from_hex(s: &str) -> Option<Vec<u8>> {
-    let s = s.trim();
-    if s.len() % 2 != 0 {
+    // Operate on BYTES so a non-ASCII/corrupt settings value can't panic on a char
+    // boundary; any non-hex byte yields None.
+    let b = s.trim().as_bytes();
+    if b.len() % 2 != 0 {
         return None;
     }
-    (0..s.len())
+    (0..b.len())
         .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+        .map(|i| {
+            let hi = (b[i] as char).to_digit(16)?;
+            let lo = (b[i + 1] as char).to_digit(16)?;
+            Some((hi * 16 + lo) as u8)
+        })
         .collect()
 }
