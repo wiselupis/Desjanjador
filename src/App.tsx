@@ -14,6 +14,7 @@ interface Status {
   autostart: boolean;
   proxy_api: boolean;
   use_tor: boolean;
+  custom_proxy: string;
   status: string;
   exit: ExitInfo | null;
   port: number;
@@ -72,6 +73,8 @@ export default function App() {
   const [update, setUpdate] = useState<UpdateInfo | null>(null);
   const [updating, setUpdating] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
+  const [editOpen, setEditOpen] = useState(false);
+  const [customVal, setCustomVal] = useState("");
 
   const refresh = useCallback(async () => {
     try {
@@ -140,6 +143,19 @@ export default function App() {
     } finally {
       setTimeout(() => setRefreshing(false), 900);
     }
+  };
+
+  const openEdit = () => {
+    setCustomVal(s?.custom_proxy ?? "");
+    setEditOpen(true);
+  };
+  const saveCustom = async (value: string) => {
+    try {
+      setS(await invoke<Status>("set_custom_proxy", { value }));
+    } catch (e) {
+      console.error(e);
+    }
+    setEditOpen(false);
   };
 
   const installBD = async () => {
@@ -237,6 +253,14 @@ export default function App() {
         <div className="status-top">
           <div className="status-line">{busy ? "processando…" : s?.status ?? "…"}</div>
           <button
+            className={`refresh ${s?.custom_proxy ? "on" : ""}`}
+            title="Usar proxy próprio"
+            aria-label="Usar proxy próprio"
+            onClick={openEdit}
+          >
+            ✎
+          </button>
+          <button
             className={`refresh ${refreshing ? "spin" : ""}`}
             title="Trocar de saída"
             aria-label="Trocar de saída"
@@ -303,6 +327,40 @@ export default function App() {
       <p className="foot">
         Fechar a janela mantém na bandeja. Reinicie o Discord após ativar.
       </p>
+
+      {editOpen && (
+        <div className="modal-overlay">
+          <div className="modal">
+            <h2>Proxy próprio (opcional)</h2>
+            <p className="modal-notes">
+              Cole um ou mais proxies SOCKS5 — o primeiro é o preferido, os outros
+              são reserva. Se nenhum funcionar, volta para o pool automático.
+            </p>
+            <textarea
+              className="custom-field"
+              rows={4}
+              spellCheck={false}
+              autoFocus
+              placeholder={
+                "ip:porta\nip:porta:usuario:senha\nusuario:senha@ip:porta\n(separe vários por vírgula, ; ou linha — ou cole um link http(s) de uma lista)"
+              }
+              value={customVal}
+              onChange={(e) => setCustomVal(e.target.value)}
+            />
+            <div className="modal-btns">
+              <button className="mini ghost" onClick={() => saveCustom("")}>
+                Limpar
+              </button>
+              <button className="mini" onClick={() => setEditOpen(false)}>
+                Cancelar
+              </button>
+              <button className="mini primary" onClick={() => saveCustom(customVal)}>
+                Salvar
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {update && (
         <div className="modal-overlay">

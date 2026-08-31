@@ -4,6 +4,7 @@ mod elevate;
 mod log;
 mod pool;
 mod proxy;
+mod secret;
 mod settings;
 mod state;
 mod sysproxy;
@@ -32,6 +33,7 @@ fn activate(shared: &Arc<Shared>) {
         let s = settings::load(&dir);
         shared.proxy_api.store(s.proxy_api, Ordering::SeqCst);
         shared.use_tor.store(s.use_tor, Ordering::SeqCst);
+        shared.set_custom(settings::load_custom_proxy(&dir));
     }
     let (tx, rx) = tokio::sync::watch::channel(false);
     *shared.stop_tx.lock().unwrap() = Some(tx);
@@ -123,6 +125,7 @@ fn status_dto(_app: &AppHandle, shared: &Shared) -> StatusDto {
         autostart: shared.autostart.load(Ordering::SeqCst),
         proxy_api: shared.proxy_api.load(Ordering::SeqCst),
         use_tor: shared.use_tor.load(Ordering::SeqCst),
+        custom_proxy: shared.get_custom().unwrap_or_default(),
         status: shared.status.lock().unwrap().clone(),
         exit: shared.get_exit(),
         port: shared.port,
@@ -186,6 +189,25 @@ fn set_use_tor(app: AppHandle, shared: State<Arc<Shared>>, on: bool) -> StatusDt
         if dropped_primary && shared.active.load(Ordering::SeqCst) {
             shared.refresh_now.notify_one();
         }
+    }
+    status_dto(&app, &shared)
+}
+
+/// Set (or clear, with an empty string) the user's custom proxy. Accepts a comma/`;`
+/// list of proxies (first = priority) or an http(s) URL to a proxy list. Stored
+/// ENCRYPTED at rest. Takes effect immediately (drops the current exit so the pool loop
+/// re-picks with the new preference on the next tick).
+#[tauri::command]
+fn set_custom_proxy(app: AppHandle, shared: State<Arc<Shared>>, value: String) -> StatusDto {
+    let dir = shared.config_dir.lock().unwrap().clone();
+    settings::save_custom_proxy(&dir, &value);
+    shared.set_custom(Some(value));
+    if shared.active.load(Ordering::SeqCst) {
+        // Re-pick with the new preference: clear the serving exit (the pool loop will
+        // prefer the custom proxy, or fall back), and wake it now.
+        shared.set_exit(None);
+        shared.set_status("aplicando saída…");
+        shared.refresh_now.notify_one();
     }
     status_dto(&app, &shared)
 }
@@ -291,6 +313,7 @@ pub fn run() {
             set_active,
             set_proxy_api,
             set_use_tor,
+            set_custom_proxy,
             refresh_exit,
             set_autostart,
             exit_app,

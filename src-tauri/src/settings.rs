@@ -32,6 +32,11 @@ pub struct Settings {
     /// Opt-in: also try a local Tor daemon as a fallback exit. Off by default.
     #[serde(default)]
     pub use_tor: bool,
+    /// The user's fixed custom proxy, stored ENCRYPTED (hex of a ChaCha20-Poly1305
+    /// blob — see `secret`). Empty = use the free pool. Kept out of plaintext so a
+    /// glance at settings.json doesn't reveal the proxy address/credentials.
+    #[serde(default)]
+    pub custom_proxy: String,
 }
 
 /// App-specific settings filename (unique, so it never collides with another app's
@@ -111,4 +116,27 @@ pub fn save_use_tor(dir: &Path, on: bool) {
     let mut s = load(dir);
     s.use_tor = on;
     write_atomic(dir, &s);
+}
+
+/// Store the user's custom proxy (plaintext in, ENCRYPTED at rest). An empty string
+/// clears it (→ use the free pool). Preserves the other fields.
+pub fn save_custom_proxy(dir: &Path, plaintext: &str) {
+    let _g = IO_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut s = load(dir);
+    s.custom_proxy = if plaintext.trim().is_empty() {
+        String::new()
+    } else {
+        crate::secret::encrypt(plaintext.trim()).unwrap_or_default()
+    };
+    write_atomic(dir, &s);
+}
+
+/// The decrypted custom proxy (plaintext), or None if unset/undecryptable.
+pub fn load_custom_proxy(dir: &Path) -> Option<String> {
+    let enc = load(dir).custom_proxy;
+    if enc.is_empty() {
+        None
+    } else {
+        crate::secret::decrypt(&enc)
+    }
 }

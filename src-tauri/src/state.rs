@@ -27,6 +27,13 @@ pub struct ExitInfo {
     /// used to promote the FASTEST backup on rotation.
     #[serde(default)]
     pub latency_ms: u32,
+    /// SOCKS5 credentials for a user-provided custom proxy (None for free-pool exits;
+    /// a local Tor exit uses its own fixed creds instead). Never persisted to
+    /// `last_exits` — the custom proxy is stored encrypted separately.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pass: Option<String>,
 }
 
 /// Snapshot sent to the React UI.
@@ -39,6 +46,9 @@ pub struct StatusDto {
     pub status: String,
     pub exit: Option<ExitInfo>,
     pub port: u16,
+    /// The user's custom-proxy field (plaintext, for the edit modal to prefill).
+    /// Empty = using the free pool.
+    pub custom_proxy: String,
 }
 
 /// Shared, thread-safe application state.
@@ -67,6 +77,10 @@ pub struct Shared {
     /// One-shot exclusion set for the NEXT discovery: the exits the user just asked to
     /// drop (refresh icon), so we don't hand back the same one(s).
     pub refresh_avoid: Mutex<Vec<String>>,
+    /// The user's custom-proxy field (plaintext): a comma/`;`-separated list of proxies
+    /// (first = priority) OR an http(s) URL to a proxy list. When set, these are PREFERRED
+    /// over the free pool (which stays warm as a fallback). None/empty = free pool only.
+    pub custom: Mutex<Option<String>>,
 }
 
 impl Shared {
@@ -84,11 +98,22 @@ impl Shared {
             config_dir: Mutex::new(PathBuf::new()),
             refresh_now: Notify::new(),
             refresh_avoid: Mutex::new(Vec::new()),
+            custom: Mutex::new(None),
         }
     }
 
     pub fn set_status(&self, s: impl Into<String>) {
         *self.status.lock().unwrap() = s.into();
+    }
+
+    /// The custom-proxy field (plaintext), or None if unset/empty.
+    pub fn get_custom(&self) -> Option<String> {
+        self.custom.lock().unwrap().clone()
+    }
+
+    /// Set (or clear, with None/empty) the custom-proxy field.
+    pub fn set_custom(&self, v: Option<String>) {
+        *self.custom.lock().unwrap() = v.filter(|s| !s.trim().is_empty());
     }
 
     pub fn set_exit(&self, e: Option<ExitInfo>) {
@@ -131,6 +156,19 @@ impl Shared {
         let mut g = self.exit.lock().unwrap();
         if matches!(g.as_ref(), Some(e) if e.addr == addr) {
             *g = Some(new);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Set the exit ONLY if still active (re-checked under the exit lock, so it
+    /// serializes with deactivate). Returns whether it wrote. Used to pin a working
+    /// custom proxy as the primary.
+    pub fn set_exit_if_active(&self, e: ExitInfo) -> bool {
+        let mut g = self.exit.lock().unwrap();
+        if self.active.load(Ordering::SeqCst) {
+            *g = Some(e);
             true
         } else {
             false

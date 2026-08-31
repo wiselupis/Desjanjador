@@ -208,10 +208,12 @@ async fn gateway_upstream(shared: &Arc<Shared>, host: &str, port: u16) -> Option
         // starved to a sub-second timeout and then wrongly cleared below.
         let left = overall.saturating_duration_since(Instant::now());
         let dial = left.min(EXIT_TIMEOUT).max(MIN_DIAL);
-        // Local Tor (127.0.0.1) is dialed WITH the fixed credentials so its stream
-        // shares the same circuit (exit country) we validated; free proxies use none.
+        // A custom proxy is dialed WITH its own creds; local Tor (127.0.0.1) with the
+        // fixed circuit-pinning creds; free proxies use none.
         let connect = async {
-            if e.addr.starts_with("127.0.0.1:") {
+            if let Some((u, p)) = e.user.as_deref().zip(e.pass.as_deref()) {
+                Socks5Stream::connect_with_password(e.addr.as_str(), (host, port), u, p).await
+            } else if e.addr.starts_with("127.0.0.1:") {
                 Socks5Stream::connect_with_password(e.addr.as_str(), (host, port), TOR_USER, TOR_PASS)
                     .await
             } else {
@@ -289,7 +291,9 @@ async fn api_upstream(shared: &Arc<Shared>, host: &str, port: u16) -> Option<Ups
         tried = true;
         let dial = left.min(EXIT_TIMEOUT).max(MIN_DIAL);
         let connect = async {
-            if e.addr.starts_with("127.0.0.1:") {
+            if let Some((u, p)) = e.user.as_deref().zip(e.pass.as_deref()) {
+                Socks5Stream::connect_with_password(e.addr.as_str(), target, u, p).await
+            } else if e.addr.starts_with("127.0.0.1:") {
                 Socks5Stream::connect_with_password(e.addr.as_str(), target, TOR_USER, TOR_PASS)
                     .await
             } else {

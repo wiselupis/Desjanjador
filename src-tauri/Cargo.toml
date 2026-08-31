@@ -1,6 +1,6 @@
 [package]
 name = "desjanjador"
-version = "0.1.19"
+version = "0.1.20"
 description = "Desjanjador — network privacy patches"
 authors = ["WiseLupis"]
 edition = "2021"
@@ -29,6 +29,10 @@ serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 tokio-socks = "0.5"
 reqwest = { version = "0.12", features = ["json", "socks"] }
+# At-rest obfuscation for the user's custom proxy string in settings.json (key is
+# embedded in the binary, so this is casual-safety, not unbreakable).
+chacha20poly1305 = "0.10"
+getrandom = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"

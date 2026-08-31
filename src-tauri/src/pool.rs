@@ -105,6 +105,11 @@ pub struct Maint {
     /// — a proactive upgrade needs UPGRADE_GRACE of these in a row, so one latency
     /// spike never triggers a visible exit swap.
     slow: u8,
+    /// The custom-proxy field last resolved (to detect changes) + the resolved,
+    /// priority-ordered entries + when a URL list was last fetched.
+    custom_raw: Option<String>,
+    custom_entries: Vec<CustomEntry>,
+    custom_fetched_at: Option<Instant>,
 }
 
 impl Maint {
@@ -129,10 +134,48 @@ pub async fn maintain(shared: Arc<Shared>, m: &mut Maint) {
         return;
     }
     ensure_candidates(m).await;
+    ensure_custom(&shared, m).await;
     // A pending user-refresh exclusion applies to this WHOLE pass — the new primary AND
     // the backup refill — so the refreshed-away exit isn't quietly re-pooled and then
     // promoted straight back. Consumed once here.
     let avoid = shared.take_refresh_avoid();
+
+    // 0) CUSTOM proxies win over the free pool. Pick the highest-priority WORKING one
+    //    and pin it as primary; the free pool is still kept warm as a fallback. If NONE
+    //    work this cycle, lazily fall through to the pool — but keep re-checking custom
+    //    every cycle, so when one recovers we switch straight back to it.
+    if !m.custom_entries.is_empty() {
+        if let Some(info) = pick_custom(&m.custom_entries).await {
+            match shared.get_exit() {
+                Some(cur) if cur.addr == info.addr => shared.set_exit_latency(&info.addr, info.latency_ms),
+                _ => {
+                    if shared.set_exit_if_active(info.clone()) {
+                        crate::log::log(&format!(
+                            "pool: proxy fixo {} ({}, {}ms)",
+                            info.ip, info.country, info.latency_ms
+                        ));
+                        shared.set_status(format!(
+                            "saída pronta: {} · {} (proxy fixo)",
+                            info.country, info.ip
+                        ));
+                    }
+                }
+            }
+            m.fails = 0;
+            if !shared.active.load(Ordering::SeqCst) {
+                return;
+            }
+            maintain_backups(&shared, m, &avoid).await; // keep the pool warm as fallback
+            persist_top_exits(&shared, m);
+            return;
+        } else if shared.get_exit().map_or(false, |e| e.user.is_some()) {
+            // The custom primary died and no other custom works → drop it so the pool
+            // takes over this cycle (we'll retry custom next cycle).
+            shared.set_exit(None);
+            shared.set_status("proxy fixo indisponível — usando o pool…");
+            crate::log::log("pool: proxy fixo indisponível — fallback para o pool");
+        }
+    }
 
     // 1) Primary health / rotation.
     match shared.get_exit() {
@@ -177,7 +220,9 @@ pub async fn maintain(shared: Arc<Shared>, m: &mut Maint) {
 fn persist_top_exits(shared: &Arc<Shared>, m: &mut Maint) {
     let mut all: Vec<ExitInfo> = shared.get_exit().into_iter().collect();
     all.extend(shared.get_backups());
-    all.retain(|e| !e.addr.starts_with("127.0.0.1:"));
+    // Never persist local Tor exits, nor the custom proxy (its creds live encrypted in
+    // settings.custom_proxy, not in plaintext last_exits).
+    all.retain(|e| !e.addr.starts_with("127.0.0.1:") && e.user.is_none());
     all.sort_by_key(|e| e.latency_ms);
     all.truncate(2);
     if all.is_empty() {
@@ -266,7 +311,7 @@ async fn maybe_upgrade(shared: &Arc<Shared>, m: &mut Maint, cur: &ExitInfo) {
         // Re-probe the target NOW before abandoning a WORKING primary — its pooled
         // latency is up to a cycle old and it may have died since. If it's dead, drop
         // it (don't re-add) and keep the current primary.
-        match gw_connect(&nb.addr, PROBE_TIMEOUT).await {
+        match gw_connect(&nb.addr, None, PROBE_TIMEOUT).await {
             Some(ms) => nb.latency_ms = ms,
             None => return,
         }
@@ -360,6 +405,38 @@ async fn ensure_candidates(m: &mut Maint) {
     }
 }
 
+/// Resolve the user's custom-proxy field into m.custom_entries (priority-ordered).
+/// Re-resolves when the field changes; a URL list is re-fetched on the FETCH_TTL cadence.
+async fn ensure_custom(shared: &Arc<Shared>, m: &mut Maint) {
+    match shared.get_custom() {
+        None => {
+            if m.custom_raw.is_some() {
+                m.custom_raw = None;
+                m.custom_entries.clear();
+                m.custom_fetched_at = None;
+            }
+        }
+        Some(r) => {
+            let is_url = {
+                let t = r.trim_start();
+                t.starts_with("http://") || t.starts_with("https://")
+            };
+            let changed = m.custom_raw.as_deref() != Some(r.as_str());
+            let stale = is_url && m.custom_fetched_at.map_or(true, |t| t.elapsed() >= FETCH_TTL);
+            if changed || stale {
+                m.custom_entries = resolve_custom_list(&r).await;
+                crate::log::log(&format!(
+                    "custom: {} proxies (fonte: {})",
+                    m.custom_entries.len(),
+                    if is_url { "URL" } else { "lista" }
+                ));
+                m.custom_raw = Some(r);
+                m.custom_fetched_at = Some(Instant::now());
+            }
+        }
+    }
+}
+
 /// Find and publish a fresh PRIMARY exit: race the cached last-working exit
 /// against the free-proxy list; the first that validates wins.
 async fn discover(shared: Arc<Shared>, m: &mut Maint, avoid: &[String]) {
@@ -446,7 +523,7 @@ async fn probe_health(addr: &str) -> Option<u32> {
     if addr.starts_with("127.0.0.1:") {
         validate(addr, PROBE_TIMEOUT).await.map(|e| e.latency_ms)
     } else {
-        gw_connect(addr, PROBE_TIMEOUT).await
+        gw_connect(addr, None, PROBE_TIMEOUT).await
     }
 }
 
@@ -519,11 +596,13 @@ async fn free_search(shared: Arc<Shared>, addrs: Vec<String>, extra_excl: Vec<St
     }
 }
 
-/// SOCKS5 proxy URL for `addr`. A local Tor proxy (127.0.0.1:*) gets fixed
-/// credentials so Tor pins all our streams to one circuit (see TOR_USER); remote
+/// SOCKS5 proxy URL for `addr`. Explicit `creds` (a custom proxy's user/pass) win; a
+/// local Tor proxy (127.0.0.1:*) otherwise gets the fixed Tor circuit-pinning creds;
 /// free proxies get no auth.
-fn socks_url(addr: &str) -> String {
-    if addr.starts_with("127.0.0.1:") {
+fn socks_url_auth(addr: &str, creds: Option<(&str, &str)>) -> String {
+    if let Some((u, p)) = creds {
+        format!("socks5h://{u}:{p}@{addr}")
+    } else if addr.starts_with("127.0.0.1:") {
         format!("socks5h://{TOR_USER}:{TOR_PASS}@{addr}")
     } else {
         format!("socks5h://{addr}")
@@ -561,7 +640,7 @@ async fn try_tor() -> Option<ExitInfo> {
 /// The recorded `latency_ms` is the gateway-connect time (the Discord-relevant one),
 /// used to promote the fastest backup on rotation.
 async fn validate(addr: &str, timeout: Duration) -> Option<ExitInfo> {
-    let (cf, gc) = tokio::join!(cf_check(addr, timeout), gw_connect(addr, timeout));
+    let (cf, gc) = tokio::join!(cf_check(addr, None, timeout), gw_connect(addr, None, timeout));
     let (ip, loc) = cf?;
     if loc.is_empty() || !allowed(&loc) {
         return None; // only exit through an allowlisted country (see ALLOWED)
@@ -572,13 +651,44 @@ async fn validate(addr: &str, timeout: Duration) -> Option<ExitInfo> {
         ip,
         country: loc,
         latency_ms,
+        user: None,
+        pass: None,
+    })
+}
+
+/// Validate a user-provided CUSTOM proxy (its own creds). Same two-gate as validate()
+/// but the country policy is RELAXED — the user chose this exit, so we accept any
+/// country except Brazil (which would defeat the geoblock) and empty. Carries the creds
+/// on the returned ExitInfo so the router dials it authenticated.
+async fn validate_custom(entry: &CustomEntry, timeout: Duration) -> Option<ExitInfo> {
+    let creds = entry.user.as_deref().zip(entry.pass.as_deref());
+    let (cf, gc) = tokio::join!(
+        cf_check(&entry.addr, creds, timeout),
+        gw_connect(&entry.addr, creds, timeout)
+    );
+    let (ip, loc) = cf?;
+    if loc.is_empty() || loc == "BR" {
+        return None; // an empty/BR exit is useless for the bypass
+    }
+    let latency_ms = gc?;
+    Some(ExitInfo {
+        addr: entry.addr.clone(),
+        ip,
+        country: loc,
+        latency_ms,
+        user: entry.user.clone(),
+        pass: entry.pass.clone(),
     })
 }
 
 /// Cloudflare trace through the proxy: returns (exit_ip, exit_country) or None. This
 /// is the MITM/certificate + true-country check.
-async fn cf_check(addr: &str, timeout: Duration) -> Option<(String, String)> {
-    let proxy = reqwest::Proxy::all(socks_url(addr)).ok()?;
+async fn cf_check(
+    addr: &str,
+    creds: Option<(&str, &str)>,
+    timeout: Duration,
+) -> Option<(String, String)> {
+    let proxy = reqwest::Proxy::all(socks_url_auth(addr, creds)).ok()?;
     let client = reqwest::Client::builder()
         .proxy(proxy)
         .timeout(timeout)
@@ -609,11 +719,13 @@ async fn cf_check(addr: &str, timeout: Duration) -> Option<(String, String)> {
 /// actually reach Discord (the check Cloudflare validation alone misses) and yields
 /// the connect latency in ms. A local Tor exit uses the pinning credentials so the
 /// probe rides the same circuit we validated.
-async fn gw_connect(addr: &str, timeout: Duration) -> Option<u32> {
+async fn gw_connect(addr: &str, creds: Option<(&str, &str)>, timeout: Duration) -> Option<u32> {
     let t = Instant::now();
     let target = ("gateway.discord.gg", 443u16);
     let connect = async {
-        if addr.starts_with("127.0.0.1:") {
+        if let Some((u, p)) = creds {
+            Socks5Stream::connect_with_password(addr, target, u, p).await
+        } else if addr.starts_with("127.0.0.1:") {
             Socks5Stream::connect_with_password(addr, target, TOR_USER, TOR_PASS).await
         } else {
             Socks5Stream::connect(addr, target).await
@@ -625,29 +737,162 @@ async fn gw_connect(addr: &str, timeout: Duration) -> Option<u32> {
     }
 }
 
-/// Fetch candidates from ProxyScrape + Geonode (in parallel, merged). Returns a
-/// list ranked by reliability (alive + low latency + high uptime first), 4145
-/// dropped, capped at 120.
-async fn fetch_candidates() -> Vec<Cand> {
-    let client = match reqwest::Client::builder()
+/// A parsed custom-proxy entry: SOCKS5 addr + optional user/pass.
+#[derive(Clone)]
+struct CustomEntry {
+    addr: String,
+    user: Option<String>,
+    pass: Option<String>,
+}
+
+/// How many custom entries to validate concurrently per cycle (bounds a big URL list).
+const CUSTOM_SCAN: usize = 16;
+
+/// Parse one proxy spec into a CustomEntry. Accepts (with an optional socks5:// prefix):
+///   `host:port` | `host:port:user:pass` | `user:pass@host:port`
+fn parse_one(spec: &str) -> Option<CustomEntry> {
+    let s = spec
+        .trim()
+        .trim_start_matches("socks5h://")
+        .trim_start_matches("socks5://")
+        .trim_start_matches("socks4://")
+        .trim();
+    if s.is_empty() {
+        return None;
+    }
+    let (user, pass, hostport) = if let Some((c, hp)) = s.rsplit_once('@') {
+        let (u, p) = c.split_once(':')?; // user:pass@host:port
+        (Some(u.to_string()), Some(p.to_string()), hp.to_string())
+    } else {
+        match s.split(':').collect::<Vec<_>>().as_slice() {
+            [h, port] => (None, None, format!("{h}:{port}")),
+            [h, port, u, p] => (Some(u.to_string()), Some(p.to_string()), format!("{h}:{port}")),
+            _ => return None,
+        }
+    };
+    let (h, port) = hostport.rsplit_once(':')?;
+    if h.is_empty() || port.parse::<u16>().is_err() {
+        return None;
+    }
+    Some(CustomEntry { addr: hostport, user, pass })
+}
+
+/// Resolve the custom field into an ordered proxy list (first = highest priority). An
+/// http(s) URL is fetched and split by ';'/newline; inline text is split by ','/';'.
+async fn resolve_custom_list(raw: &str) -> Vec<CustomEntry> {
+    let raw = raw.trim();
+    let specs: Vec<String> = if raw.starts_with("http://") || raw.starts_with("https://") {
+        let client = match build_http_client() {
+            Some(c) => c,
+            None => return Vec::new(),
+        };
+        match client.get(raw).send().await {
+            Ok(r) => match r.text().await {
+                Ok(t) => t
+                    .split(|c| c == ';' || c == '\n' || c == '\r')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect(),
+                Err(e) => {
+                    crate::log::log(&format!("custom: URL parse ERR: {}", err_chain(&e)));
+                    Vec::new()
+                }
+            },
+            Err(e) => {
+                crate::log::log(&format!("custom: URL fetch ERR: {}", err_chain(&e)));
+                Vec::new()
+            }
+        }
+    } else {
+        raw.split(|c| c == ',' || c == ';')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    };
+    specs.iter().filter_map(|s| parse_one(s)).collect()
+}
+
+/// Pick the highest-priority WORKING custom proxy: entry[0] if it validates (steady
+/// state), else scan the next CUSTOM_SCAN concurrently and take the lowest-index
+/// success. None if none work (→ the caller lazily falls back to the free pool).
+async fn pick_custom(entries: &[CustomEntry]) -> Option<ExitInfo> {
+    use tokio::task::JoinSet;
+    let limit = entries.len().min(CUSTOM_SCAN);
+    let mut set: JoinSet<(usize, Option<ExitInfo>)> = JoinSet::new();
+    for i in 0..limit {
+        let e = entries[i].clone();
+        set.spawn(async move { (i, validate_custom(&e, VALIDATE_TIMEOUT).await) });
+    }
+    let mut best: Option<(usize, ExitInfo)> = None;
+    while let Some(r) = set.join_next().await {
+        if let Ok((i, Some(info))) = r {
+            if i == 0 {
+                set.abort_all();
+                return Some(info); // top priority works → done
+            }
+            if best.as_ref().map_or(true, |(bi, _)| i < *bi) {
+                best = Some((i, info));
+            }
+        }
+    }
+    best.map(|(_, info)| info)
+}
+
+/// Flatten a reqwest error + its `source()` chain into one line, so a generic
+/// "error sending request for url (...)" reveals its real cause (tcp connect / tls /
+/// dns / timeout).
+fn err_chain(e: &dyn std::error::Error) -> String {
+    let mut msg = e.to_string();
+    let mut src = e.source();
+    while let Some(s) = src {
+        msg.push_str(&format!(" | {s}"));
+        src = s.source();
+    }
+    msg
+}
+
+/// A DNS resolver that returns ONLY IPv4 addresses. This is the REAL IPv4 force (the
+/// v0.1.19 `.local_address` did NOT stop hyper from trying an AAAA): on a machine with
+/// IPv6 enabled but no working IPv6 route (router IPv6 off), the client would connect
+/// to the black-holed IPv6 and time out → source fetch fails, even though the URL opens
+/// in a browser (browsers fall back via Happy Eyeballs). Filtering to A records skips
+/// IPv6 entirely; every host we fetch is dual-stack, so nothing is lost.
+struct Ipv4Resolver;
+impl reqwest::dns::Resolve for Ipv4Resolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        Box::pin(async move {
+            let host = name.as_str().to_string();
+            // Port 0: reqwest overrides it with the request's actual port.
+            let v4: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host.as_str(), 0))
+                .await?
+                .filter(|a| a.is_ipv4())
+                .collect();
+            let addrs: reqwest::dns::Addrs = Box::new(v4.into_iter());
+            Ok(addrs)
+        })
+    }
+}
+
+/// Shared HTTP client for fetching lists: IPv4-only DNS (dodges a black-holed IPv6
+/// route) + a browser UA (some WAFs reject reqwest's default UA). Both are why a source
+/// can fail in-app while the URL opens in a browser.
+fn build_http_client() -> Option<reqwest::Client> {
+    reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
-        // Force IPv4: on a machine with IPv6 enabled but NO working IPv6 route (e.g. the
-        // router has IPv6 off), the client would try the sources' AAAA address, black-hole,
-        // and time out -> sources=0, even though the same URL opens in a browser (browsers
-        // fall back via Happy Eyeballs). Every source + Discord's gateway is on IPv4, so
-        // binding to IPv4 removes this failure mode with no downside.
-        .local_address(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
-        // A real browser UA: some networks' WAF/IDS reject the default reqwest UA, which
-        // can make the source fetch fail (sources=0) on a machine where the same URL
-        // opens fine in a browser.
+        .dns_resolver(Arc::new(Ipv4Resolver))
         .user_agent(
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
              (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
         )
         .build()
-    {
-        Ok(c) => c,
-        Err(_) => return Vec::new(),
+        .ok()
+}
+
+/// Fetch candidates from ProxyScrape + Geonode + proxifly (in parallel, merged).
+async fn fetch_candidates() -> Vec<Cand> {
+    let client = match build_http_client() {
+        Some(c) => c,
+        None => return Vec::new(),
     };
 
     // Query all providers in parallel and merge (dedup by addr) for speed + reach.
@@ -698,12 +943,12 @@ async fn fetch_proxyscrape(client: &reqwest::Client) -> Vec<Cand> {
         Ok(r) => match r.json().await {
             Ok(v) => v,
             Err(e) => {
-                crate::log::log(&format!("pool: proxyscrape parse ERR: {e}"));
+                crate::log::log(&format!("pool: proxyscrape parse ERR: {}", err_chain(&e)));
                 return Vec::new();
             }
         },
         Err(e) => {
-            crate::log::log(&format!("pool: proxyscrape fetch ERR: {e}"));
+            crate::log::log(&format!("pool: proxyscrape fetch ERR: {}", err_chain(&e)));
             return Vec::new();
         }
     };
@@ -750,12 +995,12 @@ async fn fetch_proxifly(client: &reqwest::Client) -> Vec<Cand> {
         Ok(r) => match r.text().await {
             Ok(t) => t,
             Err(e) => {
-                crate::log::log(&format!("pool: proxifly parse ERR: {e}"));
+                crate::log::log(&format!("pool: proxifly parse ERR: {}", err_chain(&e)));
                 return Vec::new();
             }
         },
         Err(e) => {
-            crate::log::log(&format!("pool: proxifly fetch ERR: {e}"));
+            crate::log::log(&format!("pool: proxifly fetch ERR: {}", err_chain(&e)));
             return Vec::new();
         }
     };
@@ -782,12 +1027,12 @@ async fn fetch_geonode(client: &reqwest::Client) -> Vec<Cand> {
         Ok(r) => match r.json().await {
             Ok(v) => v,
             Err(e) => {
-                crate::log::log(&format!("pool: geonode parse ERR: {e}"));
+                crate::log::log(&format!("pool: geonode parse ERR: {}", err_chain(&e)));
                 return Vec::new();
             }
         },
         Err(e) => {
-            crate::log::log(&format!("pool: geonode fetch ERR: {e}"));
+            crate::log::log(&format!("pool: geonode fetch ERR: {}", err_chain(&e)));
             return Vec::new();
         }
     };
