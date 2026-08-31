@@ -631,6 +631,13 @@ async fn gw_connect(addr: &str, timeout: Duration) -> Option<u32> {
 async fn fetch_candidates() -> Vec<Cand> {
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
+        // A real browser UA: some networks' WAF/IDS reject the default reqwest UA, which
+        // can make the source fetch fail (sources=0) on a machine where the same URL
+        // opens fine in a browser.
+        .user_agent(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+             (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        )
         .build()
     {
         Ok(c) => c,
@@ -684,9 +691,15 @@ async fn fetch_proxyscrape(client: &reqwest::Client) -> Vec<Cand> {
     let val: serde_json::Value = match client.get(url).send().await {
         Ok(r) => match r.json().await {
             Ok(v) => v,
-            Err(_) => return Vec::new(),
+            Err(e) => {
+                crate::log::log(&format!("pool: proxyscrape parse ERR: {e}"));
+                return Vec::new();
+            }
         },
-        Err(_) => return Vec::new(),
+        Err(e) => {
+            crate::log::log(&format!("pool: proxyscrape fetch ERR: {e}"));
+            return Vec::new();
+        }
     };
     let arr = val
         .get("proxies")
@@ -730,9 +743,15 @@ async fn fetch_proxifly(client: &reqwest::Client) -> Vec<Cand> {
     let txt = match client.get(url).send().await {
         Ok(r) => match r.text().await {
             Ok(t) => t,
-            Err(_) => return Vec::new(),
+            Err(e) => {
+                crate::log::log(&format!("pool: proxifly parse ERR: {e}"));
+                return Vec::new();
+            }
         },
-        Err(_) => return Vec::new(),
+        Err(e) => {
+            crate::log::log(&format!("pool: proxifly fetch ERR: {e}"));
+            return Vec::new();
+        }
     };
     let mut out = Vec::new();
     for line in txt.lines() {
@@ -756,9 +775,15 @@ async fn fetch_geonode(client: &reqwest::Client) -> Vec<Cand> {
     let val: serde_json::Value = match client.get(url).send().await {
         Ok(r) => match r.json().await {
             Ok(v) => v,
-            Err(_) => return Vec::new(),
+            Err(e) => {
+                crate::log::log(&format!("pool: geonode parse ERR: {e}"));
+                return Vec::new();
+            }
         },
-        Err(_) => return Vec::new(),
+        Err(e) => {
+            crate::log::log(&format!("pool: geonode fetch ERR: {e}"));
+            return Vec::new();
+        }
     };
     let arr = val
         .get("data")
