@@ -734,7 +734,7 @@ dependencies = [
 
 [[package]]
 name = "desjanjador"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "reqwest 0.12.28",
  "serde",

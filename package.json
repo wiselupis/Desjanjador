@@ -1,7 +1,7 @@
 {
   "name": "desjanjador",
   "private": true,
-  "version": "0.1.15",
+  "version": "0.1.16",
   "author": "WiseLupis",
   "type": "module",
   "scripts": {

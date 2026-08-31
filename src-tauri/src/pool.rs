@@ -25,25 +25,19 @@ use tokio_socks::tcp::Socks5Stream;
 /// channels work there with NO government block and NO IP-triggered age/ID
 /// verification (the gateway's exit IP is Discord's effective jurisdiction), as of
 /// Aug 2026 — researched + adversarially verified. Excludes blocked countries
-/// (CN/RU/IR/UAE/EG/TR/…) and the IP-triggered age-verification ones: GB, AU, BR.
-/// The US IS included (v0.1.15): it's the fastest + largest free-proxy pool from
-/// Brazil (median gateway-connect ~4× faster than EU/Asia exits), and Discord's age
-/// gate is national/region-driven, not US-state-driven — the US-state porn-site
-/// verification laws don't apply to Discord. We still drop the two states where
-/// Discord itself ran live age checks (Texas/Utah) best-effort via the source's
-/// region field (see `US_BLOCKED_STATES` / fetch_candidates). Watch-items: GR's law
-/// takes effect 2027; DK/FR have pending bills.
+/// (CN/RU/IR/UAE/EG/TR/…) and the IP-triggered age-verification ones: GB, AU, BR, US.
+/// (US was briefly added in v0.1.15 then REVERTED in v0.1.16: live validation showed
+/// ~0% of free US proxies pass the full Cloudflare-TLS check — they accept a bare TCP
+/// connect but can't carry a real TLS session (honeypots/HTTP-only), so they'd break
+/// Discord's gateway TLS too, and the hundreds of dead US entries only crowded the
+/// candidate list and starved the validator. A GOOD US exit works — but that's BYO,
+/// not the free pool.) Watch-items: GR's law takes effect 2027; DK/FR have pending
+/// bills.
 const ALLOWED: &[&str] = &[
-    "US", "TH", "FR", "DE", "IE", "IT", "NL", "BE", "PL", "CZ", "AT", "SE", "FI", "NO",
-    "DK", "PT", "RO", "GR", "CH", "CA", "MX", "AR", "CL", "CO", "UY", "NZ", "JP", "TW",
-    "HK", "IN", "PH", "SG", "IL", "ZA", "NG", "KE", "UA", "MD", "GE", "AM", "LK",
+    "TH", "FR", "DE", "IE", "IT", "NL", "BE", "PL", "CZ", "AT", "SE", "FI", "NO", "DK",
+    "PT", "RO", "GR", "CH", "CA", "MX", "AR", "CL", "CO", "UY", "NZ", "JP", "TW", "HK",
+    "IN", "PH", "SG", "IL", "ZA", "NG", "KE", "UA", "MD", "GE", "AM", "LK",
 ];
-
-/// US states dropped from the pool (best-effort, from the source's region field): the
-/// two where Discord itself ran live IP-triggered age checks. Not fully reliable for
-/// relay proxies (the true exit IP can differ from the listed one), but these are rare
-/// in the pool and any that slip through just re-show the age gate → the user refreshes.
-const US_BLOCKED_STATES: &[&str] = &["Texas", "Utah"];
 
 /// Timeout for DISCOVERY / backup-refill validation (Cloudflare TLS + gateway
 /// CONNECT, run concurrently). Short so dead candidates are rejected fast.
@@ -76,7 +70,10 @@ const FETCH_TTL: Duration = Duration::from_secs(180);
 /// Overall wall-clock cap on a validate-race (discovery or backup refill) so an
 /// all-dead candidate list can't block the health loop for ~50s.
 const RACE_DEADLINE: Duration = Duration::from_secs(12);
-const BATCH: usize = 16;
+/// Validations kept in flight per race. Raised 16→24 (v0.1.16): free proxies validate
+/// at only ~5% live-tested, so more concurrency finds a working exit within the
+/// deadline instead of leaving the user with "no exit" on a bad batch.
+const BATCH: usize = 24;
 
 fn allowed(country: &str) -> bool {
     ALLOWED.contains(&country)
@@ -85,9 +82,6 @@ fn allowed(country: &str) -> bool {
 struct Cand {
     addr: String,
     country: String,
-    /// Region/state from the source (only ProxyScrape provides it) — used to drop
-    /// US_BLOCKED_STATES. Empty when unknown.
-    region: String,
     alive: bool,
     uptime: f64,
     timeout: f64,
@@ -657,11 +651,8 @@ async fn fetch_candidates() -> Vec<Cand> {
     cands.retain(|c| !c.addr.ends_with(":4145"));
     // Keep only candidates whose CLAIMED country is allowed or unknown (validate()
     // enforces the TRUE country); this avoids wasting validations on clearly-
-    // disallowed proxies — the free lists are heavy on CN/RU.
+    // disallowed proxies — the free lists are heavy on CN/RU/US.
     cands.retain(|c| c.country.is_empty() || allowed(&c.country));
-    // Best-effort: drop US proxies in the two states where Discord ran live age checks
-    // (source region field; empty/unknown region is kept — validate() can't see state).
-    cands.retain(|c| c.country != "US" || !US_BLOCKED_STATES.contains(&c.region.as_str()));
     // Rank purely by reliability (alive, then low latency, then high uptime): any
     // allowed country is equally fine, so we just want the fastest working one.
     cands.sort_by(|a, b| {
@@ -670,7 +661,9 @@ async fn fetch_candidates() -> Vec<Cand> {
             .then(a.timeout.partial_cmp(&b.timeout).unwrap_or(std::cmp::Ordering::Equal))
             .then(b.uptime.partial_cmp(&a.uptime).unwrap_or(std::cmp::Ordering::Equal))
     });
-    cands.truncate(160);
+    // Keep a wide working set: at ~5% live yield, the pool + backup refills need many
+    // candidates to draw from (raised 160→320 in v0.1.16).
+    cands.truncate(320);
     cands
 }
 
@@ -701,16 +694,9 @@ async fn fetch_proxyscrape(client: &reqwest::Client) -> Vec<Cand> {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        let region = p
-            .get("ip_data")
-            .and_then(|d| d.get("regionName"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
         out.push(Cand {
             addr: format!("{ip}:{port}"),
             country,
-            region,
             alive: p.get("alive").and_then(|v| v.as_bool()).unwrap_or(true),
             uptime: p.get("uptime").and_then(|v| v.as_f64()).unwrap_or(0.0),
             timeout: p
@@ -745,7 +731,6 @@ async fn fetch_proxifly(client: &reqwest::Client) -> Vec<Cand> {
         out.push(Cand {
             addr: t.to_string(),
             country: String::new(), // no metadata; validate() enforces the true country
-            region: String::new(),
             alive: true,
             uptime: 50.0,    // neutral (unknown) so it ranks mid-pack, not buried
             timeout: 2000.0, // neutral assumed latency
@@ -784,11 +769,6 @@ async fn fetch_geonode(client: &reqwest::Client) -> Vec<Cand> {
             addr: format!("{ip}:{port}"),
             country: p
                 .get("country")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-            region: p
-                .get("region")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string(),
