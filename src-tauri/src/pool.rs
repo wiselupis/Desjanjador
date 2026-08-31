@@ -79,14 +79,29 @@ fn allowed(country: &str) -> bool {
     ALLOWED.contains(&country)
 }
 
-/// Set when an outbound connect fails with WSAEACCES (os error 10013) — a firewall /
-/// security product is blocking our exe. The UI reads this to offer a one-click fix.
+/// An outbound connect failed with WSAEACCES (os error 10013) — something is blocking
+/// our exe. FIREWALL_BLOCKED offers the one-click Windows Firewall fix first; once that
+/// fix has been applied and 10013 STILL happens, AV_BLOCKED tells the UI it's a
+/// third-party antivirus (e.g. BitDefender) the user must whitelist manually.
 static FIREWALL_BLOCKED: AtomicBool = AtomicBool::new(false);
+static FIREWALL_FIX_APPLIED: AtomicBool = AtomicBool::new(false);
+static AV_BLOCKED: AtomicBool = AtomicBool::new(false);
 pub fn firewall_blocked() -> bool {
     FIREWALL_BLOCKED.load(Ordering::Relaxed)
 }
-pub fn clear_firewall_blocked() {
+pub fn av_blocked() -> bool {
+    AV_BLOCKED.load(Ordering::Relaxed)
+}
+/// Called after the user applied the Windows Firewall exception — a later 10013 then
+/// means the blocker is the antivirus, not the firewall.
+pub fn mark_firewall_fix_applied() {
+    FIREWALL_FIX_APPLIED.store(true, Ordering::Relaxed);
     FIREWALL_BLOCKED.store(false, Ordering::Relaxed);
+}
+/// Connections work again (a fetch succeeded) — clear both block flags.
+fn clear_blocked_flags() {
+    FIREWALL_BLOCKED.store(false, Ordering::Relaxed);
+    AV_BLOCKED.store(false, Ordering::Relaxed);
 }
 
 struct Cand {
@@ -332,7 +347,7 @@ async fn maybe_upgrade(shared: &Arc<Shared>, m: &mut Maint, cur: &ExitInfo) {
         // Re-probe the target NOW before abandoning a WORKING primary — its pooled
         // latency is up to a cycle old and it may have died since. If it's dead, drop
         // it (don't re-add) and keep the current primary.
-        match gw_connect(&nb.addr, None, PROBE_TIMEOUT).await {
+        match gw_connect(&nb.addr, None, false, PROBE_TIMEOUT).await {
             Some(ms) => nb.latency_ms = ms,
             None => return,
         }
@@ -552,7 +567,7 @@ async fn probe_health(addr: &str) -> Option<u32> {
     if addr.starts_with("127.0.0.1:") {
         validate(addr, PROBE_TIMEOUT).await.map(|e| e.latency_ms)
     } else {
-        gw_connect(addr, None, PROBE_TIMEOUT).await
+        gw_connect(addr, None, false, PROBE_TIMEOUT).await
     }
 }
 
@@ -625,16 +640,93 @@ async fn free_search(shared: Arc<Shared>, addrs: Vec<String>, extra_excl: Vec<St
     }
 }
 
-/// SOCKS5 proxy URL for `addr`. Explicit `creds` (a custom proxy's user/pass) win; a
-/// local Tor proxy (127.0.0.1:*) otherwise gets the fixed Tor circuit-pinning creds;
-/// free proxies get no auth.
-fn socks_url_auth(addr: &str, creds: Option<(&str, &str)>) -> String {
+/// Proxy URL for `addr` for reqwest. `http` picks the scheme (an HTTP proxy vs SOCKS5).
+/// Explicit `creds` (a custom proxy's user/pass) win; a local Tor proxy (127.0.0.1:*)
+/// otherwise gets the fixed Tor circuit-pinning creds; free proxies get no auth.
+fn proxy_url_auth(addr: &str, creds: Option<(&str, &str)>, http: bool) -> String {
+    let scheme = if http { "http" } else { "socks5h" };
     if let Some((u, p)) = creds {
-        format!("socks5h://{u}:{p}@{addr}")
-    } else if addr.starts_with("127.0.0.1:") {
+        format!("{scheme}://{u}:{p}@{addr}")
+    } else if !http && addr.starts_with("127.0.0.1:") {
         format!("socks5h://{TOR_USER}:{TOR_PASS}@{addr}")
     } else {
-        format!("socks5h://{addr}")
+        format!("{scheme}://{addr}")
+    }
+}
+
+/// Base64 (standard alphabet, padded) — for HTTP CONNECT Proxy-Authorization.
+fn base64(data: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | (b[2] as u32);
+        out.push(T[((n >> 18) & 63) as usize] as char);
+        out.push(T[((n >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 { T[((n >> 6) & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { T[(n & 63) as usize] as char } else { '=' });
+    }
+    out
+}
+
+/// Open an HTTP CONNECT tunnel through an HTTP proxy at `addr` to `host:port`, returning
+/// the raw TcpStream tunnel (usable exactly like a Direct connection). Optional Basic
+/// Proxy-Authorization. Errors if the proxy doesn't answer 2xx.
+pub(crate) async fn http_connect(
+    addr: &str,
+    host: &str,
+    port: u16,
+    creds: Option<(&str, &str)>,
+) -> std::io::Result<TcpStream> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = TcpStream::connect(addr).await?;
+    let mut req = format!("CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n");
+    if let Some((u, p)) = creds {
+        req.push_str(&format!(
+            "Proxy-Authorization: Basic {}\r\n",
+            base64(format!("{u}:{p}").as_bytes())
+        ));
+    }
+    req.push_str("Proxy-Connection: Keep-Alive\r\n\r\n");
+    stream.write_all(req.as_bytes()).await?;
+    let mut buf = Vec::with_capacity(256);
+    let mut tmp = [0u8; 256];
+    loop {
+        let n = stream.read(&mut tmp).await?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "proxy closed during CONNECT",
+            ));
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+        if buf.len() > 8192 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "CONNECT response too large",
+            ));
+        }
+    }
+    let head = String::from_utf8_lossy(&buf);
+    let status_ok = head
+        .lines()
+        .next()
+        .map(|l| l.split_whitespace().nth(1) == Some("200"))
+        .unwrap_or(false);
+    if status_ok {
+        Ok(stream)
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("CONNECT refused: {}", head.lines().next().unwrap_or("")),
+        ))
     }
 }
 
@@ -669,7 +761,7 @@ async fn try_tor() -> Option<ExitInfo> {
 /// The recorded `latency_ms` is the gateway-connect time (the Discord-relevant one),
 /// used to promote the fastest backup on rotation.
 async fn validate(addr: &str, timeout: Duration) -> Option<ExitInfo> {
-    let (cf, gc) = tokio::join!(cf_check(addr, None, timeout), gw_connect(addr, None, timeout));
+    let (cf, gc) = tokio::join!(cf_check(addr, None, false, timeout), gw_connect(addr, None, false, timeout));
     let (ip, loc) = cf?;
     if loc.is_empty() || !allowed(&loc) {
         return None; // only exit through an allowlisted country (see ALLOWED)
@@ -683,6 +775,7 @@ async fn validate(addr: &str, timeout: Duration) -> Option<ExitInfo> {
         user: None,
         pass: None,
         is_custom: false,
+        http: false,
     })
 }
 
@@ -693,8 +786,8 @@ async fn validate(addr: &str, timeout: Duration) -> Option<ExitInfo> {
 async fn validate_custom(entry: &CustomEntry, timeout: Duration) -> Option<ExitInfo> {
     let creds = entry.user.as_deref().zip(entry.pass.as_deref());
     let (cf, gc) = tokio::join!(
-        cf_check(&entry.addr, creds, timeout),
-        gw_connect(&entry.addr, creds, timeout)
+        cf_check(&entry.addr, creds, entry.http, timeout),
+        gw_connect(&entry.addr, creds, entry.http, timeout)
     );
     let (ip, loc) = cf?;
     if loc.is_empty() || loc == "BR" {
@@ -709,6 +802,7 @@ async fn validate_custom(entry: &CustomEntry, timeout: Duration) -> Option<ExitI
         user: entry.user.clone(),
         pass: entry.pass.clone(),
         is_custom: true,
+        http: entry.http,
     })
 }
 
@@ -717,9 +811,10 @@ async fn validate_custom(entry: &CustomEntry, timeout: Duration) -> Option<ExitI
 async fn cf_check(
     addr: &str,
     creds: Option<(&str, &str)>,
+    http: bool,
     timeout: Duration,
 ) -> Option<(String, String)> {
-    let proxy = reqwest::Proxy::all(socks_url_auth(addr, creds)).ok()?;
+    let proxy = reqwest::Proxy::all(proxy_url_auth(addr, creds, http)).ok()?;
     let client = reqwest::Client::builder()
         .proxy(proxy)
         .timeout(timeout)
@@ -750,8 +845,20 @@ async fn cf_check(
 /// actually reach Discord (the check Cloudflare validation alone misses) and yields
 /// the connect latency in ms. A local Tor exit uses the pinning credentials so the
 /// probe rides the same circuit we validated.
-async fn gw_connect(addr: &str, creds: Option<(&str, &str)>, timeout: Duration) -> Option<u32> {
+async fn gw_connect(
+    addr: &str,
+    creds: Option<(&str, &str)>,
+    http: bool,
+    timeout: Duration,
+) -> Option<u32> {
     let t = Instant::now();
+    if http {
+        // HTTP proxy: an actual CONNECT tunnel to the gateway.
+        return match tokio::time::timeout(timeout, http_connect(addr, "gateway.discord.gg", 443, creds)).await {
+            Ok(Ok(_)) => Some(t.elapsed().as_millis() as u32),
+            _ => None,
+        };
+    }
     let target = ("gateway.discord.gg", 443u16);
     let connect = async {
         if let Some((u, p)) = creds {
@@ -768,27 +875,36 @@ async fn gw_connect(addr: &str, creds: Option<(&str, &str)>, timeout: Duration) 
     }
 }
 
-/// A parsed custom-proxy entry: SOCKS5 addr + optional user/pass.
+/// A parsed custom-proxy entry: addr + optional user/pass, and whether it's an HTTP
+/// proxy (CONNECT tunnel) vs a SOCKS5 proxy.
 #[derive(Clone)]
 struct CustomEntry {
     addr: String,
     user: Option<String>,
     pass: Option<String>,
+    http: bool,
 }
 
 /// How many custom entries to validate concurrently per cycle (bounds a big URL list;
 /// covers any realistic hand-entered list and a decent slice of a URL pool).
 const CUSTOM_SCAN: usize = 64;
 
-/// Parse one proxy spec into a CustomEntry. Accepts (with an optional socks5:// prefix):
+/// Parse one proxy spec into a CustomEntry. Accepts (scheme prefix optional):
 ///   `host:port` | `host:port:user:pass` | `user:pass@host:port`
+///   `http(s)://user:pass@host:port` | `socks5://host:port` etc.
+/// The scheme decides HTTP-CONNECT vs SOCKS5; a trailing `/` is tolerated.
 fn parse_one(spec: &str) -> Option<CustomEntry> {
-    let s = spec
-        .trim()
-        .trim_start_matches("socks5h://")
-        .trim_start_matches("socks5://")
-        .trim_start_matches("socks4://")
-        .trim();
+    let raw = spec.trim();
+    let (http, s) = if let Some(r) = raw.strip_prefix("http://").or_else(|| raw.strip_prefix("https://")) {
+        (true, r)
+    } else {
+        let r = raw
+            .trim_start_matches("socks5h://")
+            .trim_start_matches("socks5://")
+            .trim_start_matches("socks4://");
+        (false, r)
+    };
+    let s = s.trim().trim_end_matches('/').trim();
     if s.is_empty() {
         return None;
     }
@@ -806,14 +922,21 @@ fn parse_one(spec: &str) -> Option<CustomEntry> {
     if h.is_empty() || port.parse::<u16>().is_err() {
         return None;
     }
-    Some(CustomEntry { addr: hostport, user, pass })
+    Some(CustomEntry { addr: hostport, user, pass, http })
 }
 
 /// Resolve the custom field into an ordered proxy list (first = highest priority). An
 /// http(s) URL is fetched and split by ';'/newline; inline text is split by ','/';'.
 async fn resolve_custom_list(raw: &str) -> Vec<CustomEntry> {
     let raw = raw.trim();
-    let specs: Vec<String> = if raw.starts_with("http://") || raw.starts_with("https://") {
+    // A single http(s) URL with NO credentials is a proxy-LIST to fetch. With '@' it's an
+    // HTTP PROXY (parsed inline); multiple entries (comma/`;`/newline) are always inline.
+    let is_list_url = (raw.starts_with("http://") || raw.starts_with("https://"))
+        && !raw.contains('@')
+        && !raw.contains(',')
+        && !raw.contains(';')
+        && !raw.contains('\n');
+    let specs: Vec<String> = if is_list_url {
         let client = match build_http_client() {
             Some(c) => c,
             None => return Vec::new(),
@@ -880,10 +1003,14 @@ fn err_chain(e: &dyn std::error::Error) -> String {
         msg.push_str(&format!(" | {s}"));
         src = s.source();
     }
-    // WSAEACCES: a firewall/security product is blocking our exe. Flag it so the UI can
-    // offer to add a Windows Firewall exception.
+    // WSAEACCES: a firewall/security product is blocking our exe. Offer the Windows
+    // Firewall fix first; if that was already applied and 10013 persists, it's the AV.
     if msg.contains("10013") {
-        FIREWALL_BLOCKED.store(true, Ordering::Relaxed);
+        if FIREWALL_FIX_APPLIED.load(Ordering::Relaxed) {
+            AV_BLOCKED.store(true, Ordering::Relaxed);
+        } else {
+            FIREWALL_BLOCKED.store(true, Ordering::Relaxed);
+        }
     }
     msg
 }
@@ -946,6 +1073,9 @@ async fn fetch_candidates() -> Vec<Cand> {
         gn.len(),
         px.len()
     ));
+    if ps.len() + gn.len() + px.len() > 0 {
+        clear_blocked_flags(); // outbound works now — dismiss any firewall/AV popup
+    }
     let mut cands = ps;
     cands.extend(gn);
     cands.extend(px);

@@ -128,6 +128,10 @@ fn status_dto(_app: &AppHandle, shared: &Shared) -> StatusDto {
         use_tor: shared.use_tor.load(Ordering::SeqCst),
         custom_proxy: shared.get_custom().unwrap_or_default(),
         firewall_blocked: pool::firewall_blocked(),
+        av_blocked: pool::av_blocked(),
+        exe_path: std::env::current_exe()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default(),
         status: shared.status.lock().unwrap().clone(),
         exit: shared.get_exit(),
         port: shared.port,
@@ -220,7 +224,9 @@ fn set_custom_proxy(app: AppHandle, shared: State<Arc<Shared>>, value: String) -
 #[tauri::command]
 fn apply_firewall_fix(app: AppHandle, shared: State<Arc<Shared>>) -> StatusDto {
     firewall::ensure_allowed();
-    pool::clear_firewall_blocked();
+    // Mark it applied: if 10013 recurs after this, the blocker is the antivirus, and the
+    // UI escalates to the "whitelist in your AV" popup.
+    pool::mark_firewall_fix_applied();
     if shared.active.load(Ordering::SeqCst) {
         shared.set_status("exceção aplicada — tentando novamente…");
         shared.refresh_now.notify_one();

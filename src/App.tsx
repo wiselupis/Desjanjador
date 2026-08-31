@@ -16,6 +16,8 @@ interface Status {
   use_tor: boolean;
   custom_proxy: string;
   firewall_blocked: boolean;
+  av_blocked: boolean;
+  exe_path: string;
   status: string;
   exit: ExitInfo | null;
   port: number;
@@ -78,6 +80,8 @@ export default function App() {
   const [customVal, setCustomVal] = useState("");
   const [fwDismissed, setFwDismissed] = useState(false);
   const [fwApplying, setFwApplying] = useState(false);
+  const [avDismissed, setAvDismissed] = useState(false);
+  const [copied, setCopied] = useState(false);
 
   const refresh = useCallback(async () => {
     try {
@@ -148,11 +152,24 @@ export default function App() {
     }
   };
 
-  // Re-arm the firewall popup for each fresh detection (once it's resolved, allow it to
-  // show again if the block reappears).
+  // Re-arm the popups for each fresh detection (once resolved, allow them to show again
+  // if the block reappears).
   useEffect(() => {
     if (!s?.firewall_blocked) setFwDismissed(false);
   }, [s?.firewall_blocked]);
+  useEffect(() => {
+    if (!s?.av_blocked) setAvDismissed(false);
+  }, [s?.av_blocked]);
+
+  const copyExePath = async () => {
+    try {
+      await navigator.clipboard.writeText(s?.exe_path ?? "");
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch (e) {
+      console.error(e);
+    }
+  };
 
   const applyFirewall = async () => {
     setFwApplying(true);
@@ -347,6 +364,29 @@ export default function App() {
       <p className="foot">
         Fechar a janela mantém na bandeja. Reinicie o Discord após ativar.
       </p>
+
+      {s?.av_blocked && !avDismissed && (
+        <div className="modal-overlay">
+          <div className="modal">
+            <h2>Antivírus bloqueando</h2>
+            <p className="modal-notes">
+              A exceção no firewall foi aplicada, mas o seu <b>antivírus</b> (ex:
+              BitDefender) ainda está bloqueando o Desjanjador (erro 10013). Adicione
+              este programa às exceções do antivírus — em <b>todos os módulos</b>
+              (proteção web/rede e firewall do antivírus também), não só no antivírus:
+            </p>
+            <div className="path-box">{s.exe_path}</div>
+            <div className="modal-btns">
+              <button className="mini ghost" onClick={() => setAvDismissed(true)}>
+                Entendi
+              </button>
+              <button className="mini primary" onClick={copyExePath}>
+                {copied ? "Copiado!" : "Copiar caminho"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {s?.firewall_blocked && !fwDismissed && (
         <div className="modal-overlay">

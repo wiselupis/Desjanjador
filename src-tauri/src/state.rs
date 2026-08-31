@@ -39,6 +39,10 @@ pub struct ExitInfo {
     /// but must still be treated as pinned/exempt and never persisted to last_exits.
     #[serde(default, skip)]
     pub is_custom: bool,
+    /// True if this exit is an HTTP proxy (CONNECT tunnel) rather than SOCKS5. Only ever
+    /// set for a custom exit; the free pool + Tor are always SOCKS5.
+    #[serde(default, skip)]
+    pub http: bool,
 }
 
 /// Snapshot sent to the React UI.
@@ -57,6 +61,11 @@ pub struct StatusDto {
     /// A connect failed with WSAEACCES (10013) — a firewall/security product is blocking
     /// the app. The UI offers a one-click "add Windows Firewall exception".
     pub firewall_blocked: bool,
+    /// The firewall exception was applied but 10013 persists → it's the ANTIVIRUS. The
+    /// UI shows the exe path (+ copy) so the user can whitelist it in the AV.
+    pub av_blocked: bool,
+    /// Full path to our exe, for the "add to antivirus exceptions" popup.
+    pub exe_path: String,
 }
 
 /// Shared, thread-safe application state.

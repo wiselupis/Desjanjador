@@ -411,6 +411,18 @@ body {
   outline: none;
   border-color: var(--accent);
 }
+.path-box {
+  margin: 0 0 12px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-family: ui-monospace, "Cascadia Code", monospace;
+  font-size: 11px;
+  color: var(--fg);
+  word-break: break-all;
+  user-select: text;
+}
 .custom-field::placeholder {
   color: var(--muted);
   opacity: 0.7;

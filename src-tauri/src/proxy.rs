@@ -208,27 +208,39 @@ async fn gateway_upstream(shared: &Arc<Shared>, host: &str, port: u16) -> Option
         // starved to a sub-second timeout and then wrongly cleared below.
         let left = overall.saturating_duration_since(Instant::now());
         let dial = left.min(EXIT_TIMEOUT).max(MIN_DIAL);
-        // A custom proxy is dialed WITH its own creds; local Tor (127.0.0.1) with the
-        // fixed circuit-pinning creds; free proxies use none.
-        let connect = async {
-            if let Some((u, p)) = e.user.as_deref().zip(e.pass.as_deref()) {
-                Socks5Stream::connect_with_password(e.addr.as_str(), (host, port), u, p).await
-            } else if e.addr.starts_with("127.0.0.1:") {
-                Socks5Stream::connect_with_password(e.addr.as_str(), (host, port), TOR_USER, TOR_PASS)
-                    .await
-            } else {
-                Socks5Stream::connect(e.addr.as_str(), (host, port)).await
+        // A custom HTTP proxy uses a CONNECT tunnel; a custom SOCKS5 proxy uses its own
+        // creds; local Tor (127.0.0.1) the fixed circuit-pinning creds; free proxies none.
+        let creds = e.user.as_deref().zip(e.pass.as_deref());
+        let dialed: Option<Upstream> = if e.http {
+            match tokio::time::timeout(dial, crate::pool::http_connect(e.addr.as_str(), host, port, creds)).await {
+                Ok(Ok(s)) => Some(Upstream::Direct(s)),
+                _ => None,
+            }
+        } else {
+            let connect = async {
+                if let Some((u, p)) = creds {
+                    Socks5Stream::connect_with_password(e.addr.as_str(), (host, port), u, p).await
+                } else if e.addr.starts_with("127.0.0.1:") {
+                    Socks5Stream::connect_with_password(e.addr.as_str(), (host, port), TOR_USER, TOR_PASS)
+                        .await
+                } else {
+                    Socks5Stream::connect(e.addr.as_str(), (host, port)).await
+                }
+            };
+            match tokio::time::timeout(dial, connect).await {
+                Ok(Ok(s)) => Some(Upstream::Socks(s)),
+                _ => None,
             }
         };
-        match tokio::time::timeout(dial, connect).await {
-            Ok(Ok(s)) => {
+        match dialed {
+            Some(up) => {
                 crate::log::log(&format!(
                     "router: gateway {host} -> exit {} ({})",
                     e.ip, e.country
                 ));
-                return Some(Upstream::Socks(s));
+                return Some(up);
             }
-            _ => {
+            None => {
                 // Instant make-before-break: promote the FASTEST warm backup for THIS
                 // failed exit so the retry below routes through it with no wait — but
                 // never promote the SAME exit that just failed.
@@ -290,22 +302,34 @@ async fn api_upstream(shared: &Arc<Shared>, host: &str, port: u16) -> Option<Ups
         }
         tried = true;
         let dial = left.min(EXIT_TIMEOUT).max(MIN_DIAL);
-        let connect = async {
-            if let Some((u, p)) = e.user.as_deref().zip(e.pass.as_deref()) {
-                Socks5Stream::connect_with_password(e.addr.as_str(), target, u, p).await
-            } else if e.addr.starts_with("127.0.0.1:") {
-                Socks5Stream::connect_with_password(e.addr.as_str(), target, TOR_USER, TOR_PASS)
-                    .await
-            } else {
-                Socks5Stream::connect(e.addr.as_str(), target).await
+        let creds = e.user.as_deref().zip(e.pass.as_deref());
+        let dialed: Option<Upstream> = if e.http {
+            match tokio::time::timeout(dial, crate::pool::http_connect(e.addr.as_str(), host, port, creds)).await {
+                Ok(Ok(s)) => Some(Upstream::Direct(s)),
+                _ => None,
+            }
+        } else {
+            let connect = async {
+                if let Some((u, p)) = creds {
+                    Socks5Stream::connect_with_password(e.addr.as_str(), target, u, p).await
+                } else if e.addr.starts_with("127.0.0.1:") {
+                    Socks5Stream::connect_with_password(e.addr.as_str(), target, TOR_USER, TOR_PASS)
+                        .await
+                } else {
+                    Socks5Stream::connect(e.addr.as_str(), target).await
+                }
+            };
+            match tokio::time::timeout(dial, connect).await {
+                Ok(Ok(s)) => Some(Upstream::Socks(s)),
+                _ => None,
             }
         };
-        if let Ok(Ok(s)) = tokio::time::timeout(dial, connect).await {
+        if let Some(up) = dialed {
             crate::log::log(&format!(
                 "router: api {host} -> exit {} ({}, {}ms)",
                 e.ip, e.country, e.latency_ms
             ));
-            return Some(Upstream::Socks(s));
+            return Some(up);
         }
     }
     if tried {
