@@ -25,17 +25,19 @@ use tokio_socks::tcp::Socks5Stream;
 /// channels work there with NO government block and NO IP-triggered age/ID
 /// verification (the gateway's exit IP is Discord's effective jurisdiction), as of
 /// Aug 2026 — researched + adversarially verified. Excludes blocked countries
-/// (CN/RU/IR/UAE/EG/TR/…) and the IP-triggered age-verification ones: GB, AU, BR, US.
-/// (US was briefly added in v0.1.15 then REVERTED in v0.1.16: live validation showed
-/// ~0% of free US proxies pass the full Cloudflare-TLS check — they accept a bare TCP
-/// connect but can't carry a real TLS session (honeypots/HTTP-only), so they'd break
-/// Discord's gateway TLS too, and the hundreds of dead US entries only crowded the
-/// candidate list and starved the validator. A GOOD US exit works — but that's BYO,
-/// not the free pool.) Watch-items: GR's law takes effect 2027; DK/FR have pending
+/// (CN/RU/IR/UAE/EG/TR/…) and the country-IP-restriction ones: GB, AU, BR.
+/// US IS INCLUDED (v0.1.24): low-latency from Brazil and ~6-8% of free US proxies
+/// validate (the earlier "~0%" was a filtering artifact, not reality). US was
+/// previously grouped with GB/AU, but unlike them the US has NO country-level IP age
+/// gate — Discord's US age handling is a GLOBAL, account-behavioural inference
+/// (teen-by-default, 2026), not triggered by the exit IP's state/country — so a US exit
+/// is no worse than DE/FR/NL for restricted channels, and per-state filtering would buy
+/// nothing. GB/AU stay out because their age check IS country-IP-triggered (Online
+/// Safety Act / eSafety). Watch-items: GR's law takes effect 2027; DK/FR have pending
 /// bills.
 const ALLOWED: &[&str] = &[
     "TH", "FR", "DE", "IE", "IT", "NL", "BE", "PL", "CZ", "AT", "SE", "FI", "NO", "DK",
-    "PT", "RO", "GR", "CH", "CA", "MX", "AR", "CL", "CO", "UY", "NZ", "JP", "TW", "HK",
+    "PT", "RO", "GR", "CH", "US", "CA", "MX", "AR", "CL", "CO", "UY", "NZ", "JP", "TW", "HK",
     "IN", "PH", "SG", "IL", "ZA", "NG", "KE", "UA", "MD", "GE", "AM", "LK",
 ];
 
@@ -1088,7 +1090,7 @@ async fn fetch_candidates() -> Vec<Cand> {
     cands.retain(|c| !c.addr.ends_with(":4145"));
     // Keep only candidates whose CLAIMED country is allowed or unknown (validate()
     // enforces the TRUE country); this avoids wasting validations on clearly-
-    // disallowed proxies — the free lists are heavy on CN/RU/US.
+    // disallowed proxies — the free lists are heavy on CN/RU.
     cands.retain(|c| c.country.is_empty() || allowed(&c.country));
     // Rank purely by reliability (alive, then low latency, then high uptime): any
     // allowed country is equally fine, so we just want the fastest working one.
