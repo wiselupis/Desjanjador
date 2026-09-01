@@ -45,6 +45,8 @@ jobs:
           files: |
             src-tauri/target/release/desjanjador.exe
             Install.bat
+            Install-With-Exception.ps1
+            Install-With-Exception.bat
             Uninstall.bat
             README.md
           fail_on_unmatched_files: true
