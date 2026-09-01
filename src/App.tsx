@@ -82,6 +82,7 @@ export default function App() {
   const [fwApplying, setFwApplying] = useState(false);
   const [avDismissed, setAvDismissed] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [updateBlocked, setUpdateBlocked] = useState(false);
 
   const refresh = useCallback(async () => {
     try {
@@ -228,7 +229,15 @@ export default function App() {
       // The app replaces its exe and relaunches; this window closes.
     } catch (e) {
       setUpdating(false);
-      alert("Falha ao atualizar: " + e);
+      const msg = String(e);
+      // os error 225 = ERROR_VIRUS_INFECTED: Defender/AV blocked the exe swap.
+      // Show actionable AV guidance instead of the raw "renomear atual" error.
+      if (/\b225\b|vírus|virus|unwanted|potentially|renomear atual/i.test(msg)) {
+        setUpdate(null);
+        setUpdateBlocked(true);
+      } else {
+        alert("Falha ao atualizar: " + msg);
+      }
     }
   };
 
@@ -465,6 +474,30 @@ export default function App() {
               </button>
               <button className="mini primary" disabled={updating} onClick={applyUpdate}>
                 {updating ? "Atualizando…" : "Atualizar"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {updateBlocked && (
+        <div className="modal-overlay">
+          <div className="modal">
+            <h2>Antivírus bloqueou a atualização</h2>
+            <p className="modal-notes">
+              O Windows Defender (ou seu antivírus) marcou o Desjanjador como
+              suspeito e impediu a troca do arquivo (erro 225). Adicione este
+              programa às exceções do antivírus — em <b>todos os módulos</b> — e
+              tente atualizar de novo. Ou baixe a nova versão manualmente na página
+              de releases do GitHub.
+            </p>
+            <div className="path-box">{s?.exe_path}</div>
+            <div className="modal-btns">
+              <button className="mini ghost" onClick={() => setUpdateBlocked(false)}>
+                Entendi
+              </button>
+              <button className="mini primary" onClick={copyExePath}>
+                {copied ? "Copiado!" : "Copiar caminho"}
               </button>
             </div>
           </div>
