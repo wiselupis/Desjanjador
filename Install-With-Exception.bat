@@ -52,6 +52,10 @@ netsh advfirewall firewall delete rule name=all program="%EXE%" >nul 2>&1
 netsh advfirewall firewall add rule name=Desjanjador dir=out action=allow program="%EXE%" enable=yes profile=any >nul 2>&1
 netsh advfirewall firewall add rule name=Desjanjador dir=in  action=allow program="%EXE%" enable=yes profile=any >nul 2>&1
 
+REM --- fecha instancia aberta: libera o .exe pro update e evita 2 janelas
+REM     (a porta 127.0.0.1:43110 so aceita uma instancia). ---
+taskkill /im desjanjador.exe /f >nul 2>&1
+
 REM --- 3) baixa / atualiza (mesma logica do Install.bat) ---
 echo ==^> Verificando a versao...
 set "DJ_REPO=%REPO%"
