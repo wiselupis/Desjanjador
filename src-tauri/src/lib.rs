@@ -473,12 +473,41 @@ pub fn run() {
                 // is never re-proxied. Nudge the user to restart Discord so its
                 // gateway re-connects through the exit.
                 if was_active {
-                    let _ = handle
-                        .notification()
-                        .builder()
-                        .title("Desjanjador ativo")
-                        .body("Se o Discord já estiver aberto, reinicie-o para liberar o Go Live e a câmera.")
-                        .show();
+                    // Discord likely opened its gateway on the direct route before we were
+                    // ready. Wait until an exit is actually up (so the relaunch routes
+                    // correctly), then restart any already-open Discord so its new gateway
+                    // goes through the exit. Falls back to nudging a manual restart if no
+                    // exit comes up in time.
+                    let h = handle.clone();
+                    let sh = shared_setup.clone();
+                    std::thread::spawn(move || {
+                        let mut waited = 0;
+                        while sh.get_exit().is_none() && waited < 60 {
+                            std::thread::sleep(std::time::Duration::from_millis(500));
+                            waited += 1;
+                        }
+                        if sh.get_exit().is_some() {
+                            let restarted = crate::clients::restart_running_discords();
+                            if !restarted.is_empty() {
+                                let _ = h
+                                    .notification()
+                                    .builder()
+                                    .title("Desjanjador")
+                                    .body(format!(
+                                        "Discord reiniciado ({}) — Go Live e câmera liberados.",
+                                        restarted.join(", ")
+                                    ))
+                                    .show();
+                            }
+                        } else {
+                            let _ = h
+                                .notification()
+                                .builder()
+                                .title("Desjanjador ativo")
+                                .body("Se o Discord já estiver aberto, reinicie-o para liberar o Go Live e a câmera.")
+                                .show();
+                        }
+                    });
                 }
                 // Quietly notify about updates instead of popping the in-window
                 // dialog (which still appears if the user opens the window).

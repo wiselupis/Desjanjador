@@ -143,6 +143,65 @@ pub fn patch_client() -> Result<String, String> {
     Err("Nenhum mod de cliente — clique em Instalar BetterDiscord primeiro".into())
 }
 
+/// On autostart, Discord often opens its gateway on the direct (BR) route before our proxy
+/// is ready — and Discord never re-proxies an already-open socket. Restart every RUNNING
+/// Discord flavor so it re-reads the system PAC and brings its gateway up through the exit.
+/// BetterDiscord/Vencord/Equicord run INSIDE the Discord process, so relaunching the exe
+/// re-injects them automatically. Returns the flavors that were restarted.
+#[cfg(windows)]
+pub fn restart_running_discords() -> Vec<String> {
+    let mut restarted = Vec::new();
+    for f in FLAVORS {
+        let exe = format!("{f}.exe");
+        if !process_running(&exe) {
+            continue;
+        }
+        // Relaunch via <flavor>\Update.exe --processStart <exe> — the same launcher the
+        // Start-menu shortcut uses (picks the newest app-* build; client mods re-hook).
+        let update = match localappdata().map(|p| p.join(f).join("Update.exe")) {
+            Some(u) if u.is_file() => u,
+            _ => continue, // no canonical launcher — don't kill what we can't relaunch
+        };
+        kill_process(&exe);
+        let _ = run_hidden(std::process::Command::new(&update).arg("--processStart").arg(&exe));
+        restarted.push((*f).to_string());
+        crate::log::log(&format!("clients: reiniciou {f} (rota do gateway)"));
+    }
+    restarted
+}
+
+#[cfg(windows)]
+fn process_running(exe: &str) -> bool {
+    run_hidden_output(std::process::Command::new("tasklist").args(["/FI", &format!("IMAGENAME eq {exe}"), "/NH"]))
+        .map(|s| s.to_lowercase().contains(&exe.to_lowercase()))
+        .unwrap_or(false)
+}
+
+#[cfg(windows)]
+fn kill_process(exe: &str) {
+    let _ = run_hidden(std::process::Command::new("taskkill").args(["/F", "/IM", exe]));
+}
+
+#[cfg(windows)]
+fn run_hidden(cmd: &mut std::process::Command) -> std::io::Result<std::process::ExitStatus> {
+    use std::os::windows::process::CommandExt;
+    cmd.creation_flags(0x0800_0000).status() // CREATE_NO_WINDOW
+}
+
+#[cfg(windows)]
+fn run_hidden_output(cmd: &mut std::process::Command) -> Option<String> {
+    use std::os::windows::process::CommandExt;
+    cmd.creation_flags(0x0800_0000)
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+}
+
+#[cfg(not(windows))]
+pub fn restart_running_discords() -> Vec<String> {
+    Vec::new()
+}
+
 /// Safety-net BD plugin: keeps the voice region off Brazil so a session created
 /// abroad stays coherent. Defensive (never throws into the client). Extend the
 /// marked spot with the exact Go Live experiment override if you want.
