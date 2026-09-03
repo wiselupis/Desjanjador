@@ -208,9 +208,18 @@ pub fn restart_running_discords() -> Vec<String> {
 const GO_LIVE_PLUGIN: &str = r#"/**
  * @name Desjanjador
  * @author Lucas
- * @description Go Live safety-net: overrides voice region away from Brazil. The real unblock is Desjanjador's gateway proxy.
- * @version 0.1.0
+ * @description Go Live safety-net: voice-region override + Go Live "zombie" (frozen screenshare) DETECTION. The real unblock is Desjanjador's gateway proxy.
+ * @version 0.2.0
  */
+// RTC freeze ("zombie") discovery + recovery scaffold.
+// Discord's Go Live sometimes keeps the connection alive but the ENCODED VIDEO OUTPUT
+// freezes (framesEncoded/bitrate/resolution stall) while a viewer still wants it. The
+// stream lives in the native `discord_voice` addon, not window.RTCPeerConnection. We wrap
+// the stream-connection creator, poll getFilteredStats(2, cb), and detect a stalled output.
+// AUTO_RECOVER (conn.destroy() on the STREAM connection only → Discord renegotiates it) is
+// gated OFF until the exact stats field names are confirmed from a real freeze's log — a
+// wrong-field guess must never drop a healthy stream. Flip AUTO_RECOVER to true once the
+// "[Desjanjador RTC] stats sample:" log confirms `framesEncoded` on your Discord build.
 module.exports = class Desjanjador {
   constructor() { this._undo = []; this.REGION = "us-east"; }
   start() {
@@ -230,9 +239,84 @@ module.exports = class Desjanjador {
           }
         }
       }
-      // === extend here: override the Go Live guard experiment for full client-side effect ===
       if (BdApi.UI && BdApi.UI.showToast) BdApi.UI.showToast("Desjanjador: region override active", { type: "success" });
     } catch (e) { console.error("[Desjanjador]", e); }
+    try { this._startRtcWatch(); } catch (e) { console.error("[Desjanjador RTC]", e); }
+  }
+  _startRtcWatch() {
+    const AUTO_RECOVER = false; // <-- flip to true once a real freeze confirms the fields
+    const CFG = { POLL_MS: 3000, WARMUP_MS: 90000, FREEZE_MS: 20000, COOLDOWN_MS: 15000, MAX_TRIES: 3, AUTO_RECOVER: AUTO_RECOVER };
+    const nm = window.DiscordNative && window.DiscordNative.nativeModules;
+    if (!nm || typeof nm.requireModule !== "function") { console.warn("[Desjanjador RTC] no DiscordNative"); return; }
+    let voice = null;
+    try { voice = nm.requireModule("discord_voice"); } catch (e) {}
+    if (!voice) { console.warn("[Desjanjador RTC] discord_voice addon not available"); return; }
+    const CREATOR = "createOwnStreamConnectionWithOptions";
+    if (typeof voice[CREATOR] !== "function") { console.warn("[Desjanjador RTC] stream creator missing (Discord build changed?)"); return; }
+    const self = this;
+    const orig = voice[CREATOR];
+    voice[CREATOR] = function () {
+      const conn = orig.apply(this, arguments);
+      try { if (conn) self._watchStream(conn, CFG); } catch (e) {}
+      return conn;
+    };
+    this._undo.push(() => { try { voice[CREATOR] = orig; } catch (e) {} });
+    console.log("[Desjanjador RTC] watching Go Live streams (detection" + (AUTO_RECOVER ? "+recover" : "-only") + ")");
+  }
+  _watchStream(conn, cfg) {
+    if (!conn || typeof conn.getFilteredStats !== "function") { console.warn("[Desjanjador RTC] stream conn has no getFilteredStats"); return; }
+    const st = { startedAt: Date.now(), lastOut: null, lastOutAt: Date.now(), everProgressed: false, lastActAt: 0, tries: 0, logged: false, dead: false };
+    const self = this;
+    const timer = setInterval(function () {
+      if (st.dead) { clearInterval(timer); return; }
+      try { conn.getFilteredStats(2, function (stats) { try { self._evalStats(conn, st, stats, cfg, timer); } catch (e) {} }); }
+      catch (e) { clearInterval(timer); }
+    }, cfg.POLL_MS);
+    this._undo.push(() => clearInterval(timer));
+  }
+  _evalStats(conn, st, stats, cfg, timer) {
+    if (!st.logged) { st.logged = true; try { console.log("[Desjanjador RTC] stats sample:", this._summarize(stats)); } catch (e) {} }
+    const v = this._pickVideo(stats);
+    if (!v) return;
+    const out = Number(v.framesEncoded);
+    if (!Number.isFinite(out)) return; // incomplete stats -> fail closed
+    const now = Date.now();
+    if (st.lastOut === null) { st.lastOut = out; st.lastOutAt = now; return; }
+    if (out !== st.lastOut) { if (out > st.lastOut) st.everProgressed = true; st.lastOut = out; st.lastOutAt = now; return; }
+    // Output is stalled. Only meaningful if this counter was ALIVE before (guards a wrong field).
+    if (!st.everProgressed) return;
+    if (now - st.startedAt < cfg.WARMUP_MS) return;
+    const frozenMs = now - st.lastOutAt;
+    if (frozenMs < cfg.FREEZE_MS) return;
+    const capturing = this._captureAlive(v);
+    console.warn("[Desjanjador RTC] output FROZEN " + Math.round(frozenMs / 1000) + "s (framesEncoded=" + out + ", capturing=" + capturing + ")");
+    if (!capturing) return; // if capture also died it's a different failure; don't churn the stream
+    try { if (BdApi.UI && BdApi.UI.showToast) BdApi.UI.showToast("Desjanjador: transmissão congelada (" + Math.round(frozenMs / 1000) + "s)", { type: "warning" }); } catch (e) {}
+    if (!cfg.AUTO_RECOVER) return; // detection-only until fields are confirmed
+    if (now - st.lastActAt < cfg.COOLDOWN_MS || st.tries >= cfg.MAX_TRIES) return;
+    st.lastActAt = now; st.tries++;
+    console.warn("[Desjanjador RTC] recovering: destroying the stream connection (try " + st.tries + ")");
+    try { conn.destroy(); } catch (e) {}
+    st.dead = true; clearInterval(timer); // a fresh stream conn will be re-captured by the creator wrap
+  }
+  _pickVideo(stats) {
+    try {
+      if (!stats || typeof stats !== "object") return null;
+      let best = null;
+      const consider = (o) => { if (o && typeof o === "object" && (typeof o.framesEncoded === "number" || typeof o.captureFrames === "number")) { if (!best || (o.framesEncoded || 0) > (best.framesEncoded || 0)) best = o; } };
+      const scan = (o, d) => { if (!o || typeof o !== "object" || d > 2) return; consider(o); for (const k in o) { try { scan(o[k], d + 1); } catch (e) {} } };
+      scan(stats, 0);
+      return best;
+    } catch (e) { return null; }
+  }
+  _captureAlive(v) { try { return Number(v.captureFrames) > 0 || Number(v.inputFrameRate) > 0 || Number(v.captureFrameRate) > 0; } catch (e) { return true; } }
+  _summarize(stats) {
+    try {
+      const out = [];
+      const walk = (o, p, d) => { if (!o || typeof o !== "object" || d > 3) return; for (const k in o) { const val = o[k]; if (typeof val === "number") out.push(p + k + "=" + val); else if (typeof val === "object") walk(val, p + k + ".", d + 1); } };
+      walk(stats, "", 0);
+      return out.slice(0, 80).join(" ") || "(no numeric fields)";
+    } catch (e) { return "(unsummarizable)"; }
   }
   stop() { for (const u of this._undo) { try { u(); } catch (e) {} } this._undo = []; }
 };
