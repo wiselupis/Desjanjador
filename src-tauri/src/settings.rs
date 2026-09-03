@@ -118,25 +118,24 @@ pub fn save_use_tor(dir: &Path, on: bool) {
     write_atomic(dir, &s);
 }
 
-/// Store the user's custom proxy (plaintext in, ENCRYPTED at rest). An empty string
-/// clears it (→ use the free pool). Preserves the other fields.
+/// Store the user's custom proxy (PLAINTEXT — it's the user's own proxy on their own
+/// machine; the previous ChaCha20 "obfuscation" baked its key into the binary, so it added
+/// zero real protection while giving AV engines a crypto routine to flag). Empty clears it.
 pub fn save_custom_proxy(dir: &Path, plaintext: &str) {
     let _g = IO_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut s = load(dir);
-    s.custom_proxy = if plaintext.trim().is_empty() {
-        String::new()
-    } else {
-        crate::secret::encrypt(plaintext.trim()).unwrap_or_default()
-    };
+    s.custom_proxy = plaintext.trim().to_string();
     write_atomic(dir, &s);
 }
 
-/// The decrypted custom proxy (plaintext), or None if unset/undecryptable.
+/// The stored custom proxy, or None if unset. A value with no ':' is dropped — that's
+/// either empty or a legacy ChaCha20 blob (pre-0.1.26, no longer decodable); every valid
+/// proxy spec (host:port, user:pass@host:port, http(s) URL) contains a ':'. User re-enters.
 pub fn load_custom_proxy(dir: &Path) -> Option<String> {
-    let enc = load(dir).custom_proxy;
-    if enc.is_empty() {
-        None
+    let v = load(dir).custom_proxy;
+    if v.contains(':') {
+        Some(v)
     } else {
-        crate::secret::decrypt(&enc)
+        None
     }
 }

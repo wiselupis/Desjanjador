@@ -5,7 +5,6 @@ mod firewall;
 mod log;
 mod pool;
 mod proxy;
-mod secret;
 mod settings;
 mod state;
 mod sysproxy;
