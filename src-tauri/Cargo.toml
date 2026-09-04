@@ -1,6 +1,6 @@
 [package]
 name = "desjanjador"
-version = "0.1.27"
+version = "0.1.28"
 description = "Desjanjador — network privacy patches"
 authors = ["WiseLupis"]
 edition = "2021"

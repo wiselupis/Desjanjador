@@ -207,9 +207,9 @@ pub fn restart_running_discords() -> Vec<String> {
 /// marked spot with the exact Go Live experiment override if you want.
 const GO_LIVE_PLUGIN: &str = r#"/**
  * @name Desjanjador
- * @author Lucas
- * @description Go Live safety-net: voice-region override + Go Live "zombie" (frozen screenshare) DETECTION. The real unblock is Desjanjador's gateway proxy.
- * @version 0.2.0
+ * @author WiseLupis
+ * @description Reabilita Go Live/câmera no Brasil neutralizando o "video guard" do Discord (2026-08) + override da região de voz, e detecta congelamento da transmissão. A saída real é o proxy do Desjanjador.
+ * @version 0.3.0
  */
 // RTC freeze ("zombie") discovery + recovery scaffold.
 // Discord's Go Live sometimes keeps the connection alive but the ENCODED VIDEO OUTPUT
@@ -223,25 +223,56 @@ const GO_LIVE_PLUGIN: &str = r#"/**
 module.exports = class Desjanjador {
   constructor() { this._undo = []; this.REGION = "us-east"; }
   start() {
+    const W = BdApi.Webpack;
+    // 1) Neutralize Discord's 2026-08 "video guard" so Go Live / camera re-enable.
+    try { this._neutralizeVideoGuard(W); } catch (e) { console.error("[Desjanjador] video-guard", e); }
+    // 2) Keep the voice/stream region off Brazil (GoLiveBypass's RTCRegionStore override).
     try {
-      const W = BdApi.Webpack;
-      const RTC = W.getModule(m => m && (m.getPreferredRegions || m.getPreferredRegion));
+      const RTC = (W.getStore && W.getStore("RTCRegionStore")) || W.getModule(m => m && (m.getPreferredRegions || m.getPreferredRegion));
       if (RTC) {
         const region = this.REGION;
         for (const key of ["getPreferredRegion", "getPreferredRegions"]) {
           if (typeof RTC[key] === "function") {
             const orig = RTC[key].bind(RTC);
-            RTC[key] = function () {
-              try { return key.endsWith("s") ? [region] : region; }
-              catch (e) { return orig.apply(this, arguments); }
-            };
+            RTC[key] = function () { try { return key.endsWith("s") ? [region] : region; } catch (e) { return orig.apply(this, arguments); } };
             this._undo.push(() => { RTC[key] = orig; });
           }
         }
+        if (typeof RTC.shouldIncludePreferredRegion === "function") {
+          const so = RTC.shouldIncludePreferredRegion.bind(RTC);
+          RTC.shouldIncludePreferredRegion = function () { return true; };
+          this._undo.push(() => { RTC.shouldIncludePreferredRegion = so; });
+        }
       }
-      if (BdApi.UI && BdApi.UI.showToast) BdApi.UI.showToast("Desjanjador: region override active", { type: "success" });
-    } catch (e) { console.error("[Desjanjador]", e); }
+    } catch (e) { console.error("[Desjanjador] region", e); }
+    // 3) RTC freeze ("zombie") detection (recovery gated off).
     try { this._startRtcWatch(); } catch (e) { console.error("[Desjanjador RTC]", e); }
+  }
+  _neutralizeVideoGuard(W) {
+    // Discord assigns a per-user experiment "2026-08-video-guard"; variantId 1/2 DISABLE Go
+    // Live/camera. We force those to the control bucket (variantId 0) so the client re-enables
+    // the buttons — the BdApi-compatible equivalent of GoLiveBypass emptying the experiment's
+    // variations. (A reload/reconnect is needed for the guard to be re-read after enabling.)
+    const VIDEO_GUARD = "2026-08-video-guard";
+    let Apex = null;
+    try { Apex = W.getStore ? W.getStore("ApexExperimentStore") : null; } catch (e) {}
+    if (!Apex) { try { Apex = W.getModule(m => m && typeof m.getServerAssignment === "function"); } catch (e) {} }
+    if (Apex && typeof Apex.getServerAssignment === "function") {
+      const orig = Apex.getServerAssignment.bind(Apex);
+      Apex.getServerAssignment = function (kind, unitId, name) {
+        const r = orig.apply(this, arguments);
+        if (name === VIDEO_GUARD && r && typeof r === "object" && (r.variantId === 1 || r.variantId === 2)) {
+          try { return Object.assign({}, r, { variantId: 0 }); } catch (e) { return { variantId: 0 }; }
+        }
+        return r;
+      };
+      this._undo.push(() => { try { Apex.getServerAssignment = orig; } catch (e) {} });
+      console.log("[Desjanjador] video-guard neutralized (ApexExperimentStore.getServerAssignment)");
+      if (BdApi.UI && BdApi.UI.showToast) BdApi.UI.showToast("Desjanjador: video guard neutralizado", { type: "success" });
+    } else {
+      console.warn("[Desjanjador] ApexExperimentStore not found — video guard NOT neutralized");
+      if (BdApi.UI && BdApi.UI.showToast) BdApi.UI.showToast("Desjanjador: ApexExperimentStore não encontrado", { type: "error" });
+    }
   }
   _startRtcWatch() {
     const AUTO_RECOVER = false; // <-- flip to true once a real freeze confirms the fields
